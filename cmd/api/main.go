@@ -7,8 +7,10 @@ import (
 
 	"trimly-platform/internal/auth"
 	"trimly-platform/internal/config"
+	"trimly-platform/internal/link"
 	"trimly-platform/internal/pkg/httputil"
 	"trimly-platform/internal/pkg/mail"
+	"trimly-platform/internal/workspace"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -16,7 +18,6 @@ import (
 func main() {
 	cfg := config.LoadConfig()
 
-	// Connect to PostgreSQL database pool
 	ctx := context.Background()
 	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -30,15 +31,25 @@ func main() {
 		log.Println("Successfully connected to PostgreSQL database")
 	}
 
-	// Initialize Email Adapter
+	// Adapters
 	mailAdapter := mail.NewMailHogAdapter(cfg.SMTPHost, cfg.SMTPPort)
 
-	// Initialize Auth Module (Repository, Service, Handler)
+	// Auth Module
 	authRepo := auth.NewRepository(dbPool)
 	authService := auth.NewService(authRepo, mailAdapter)
 	authHandler := auth.NewHandler(authService)
 
-	// HTTP Routes
+	// Workspace Module
+	workspaceRepo := workspace.NewRepository(dbPool)
+	workspaceService := workspace.NewService(workspaceRepo)
+	workspaceHandler := workspace.NewHandler(workspaceService)
+
+	// Link Module
+	linkRepo := link.NewRepository(dbPool)
+	linkService := link.NewService(linkRepo)
+	linkHandler := link.NewHandler(linkService)
+
+	// Router
 	mux := http.NewServeMux()
 
 	// Health Check
@@ -49,21 +60,37 @@ func main() {
 		})
 	})
 
+	// Public Redirect Route (Fast Path)
+	mux.HandleFunc("GET /r/", linkHandler.PublicRedirect)
+
 	// Auth Endpoints
 	mux.HandleFunc("POST /v1/auth/register", authHandler.Register)
 	mux.HandleFunc("POST /v1/auth/verify-email", authHandler.VerifyEmail)
 	mux.HandleFunc("POST /v1/auth/login", authHandler.Login)
 	mux.HandleFunc("POST /v1/auth/logout", authHandler.Logout)
 
-	// Protected Verification Test Endpoint
-	mux.Handle("GET /v1/auth/me", authHandler.AuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Protected Routes (Session Auth + Verified Email required)
+	verifiedAuthChain := func(handler http.HandlerFunc) http.Handler {
+		return authHandler.AuthMiddleware(authHandler.RequireVerifiedEmailMiddleware(http.HandlerFunc(handler)))
+	}
+
+	authChain := func(handler http.HandlerFunc) http.Handler {
+		return authHandler.AuthMiddleware(http.HandlerFunc(handler))
+	}
+
+	mux.Handle("GET /v1/auth/me", authChain(func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value(auth.UserContextKey).(*auth.User)
 		httputil.RespondJSON(w, http.StatusOK, user)
-	})))
+	}))
 
-	mux.Handle("GET /v1/test-verified-action", authHandler.AuthMiddleware(authHandler.RequireVerifiedEmailMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		httputil.RespondJSON(w, http.StatusOK, map[string]string{"message": "Action permitted for verified user"})
-	}))))
+	// Link Protected Endpoints
+	mux.Handle("POST /v1/links", verifiedAuthChain(linkHandler.CreateLink))
+	mux.Handle("GET /v1/links/analytics", authChain(linkHandler.GetAnalytics))
+
+	// Workspace Protected Endpoints
+	mux.Handle("POST /v1/workspaces", authChain(workspaceHandler.CreateWorkspace))
+	mux.Handle("GET /v1/workspaces", authChain(workspaceHandler.ListWorkspaces))
+	mux.Handle("POST /v1/workspaces/members", authChain(workspaceHandler.AddMember))
 
 	log.Printf("Trimly Platform API server running on port :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
