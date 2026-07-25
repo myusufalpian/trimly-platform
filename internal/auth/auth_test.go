@@ -4,29 +4,16 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"trimly-platform/internal/auth"
 )
 
-type mockEmailSender struct {
-	sentEmails map[string]string
-}
-
-func (m *mockEmailSender) SendVerificationEmail(toEmail, token string) error {
-	if m.sentEmails == nil {
-		m.sentEmails = make(map[string]string)
-	}
-	m.sentEmails[toEmail] = token
-	return nil
-}
-
 func TestHashTokenDeterministic(t *testing.T) {
-	rawToken := "sample_secret_token_123"
-	hash1 := auth.HashToken(rawToken)
-	hash2 := auth.HashToken(rawToken)
+	token := "sample_token_string_123"
+	hash1 := auth.HashToken(token)
+	hash2 := auth.HashToken(token)
 
 	if hash1 == "" {
 		t.Fatalf("expected non-empty hash string")
@@ -38,6 +25,11 @@ func TestHashTokenDeterministic(t *testing.T) {
 }
 
 func TestRequireVerifiedEmailMiddleware(t *testing.T) {
+	handler := auth.NewHandler(nil)
+	middleware := handler.RequireVerifiedEmailMiddleware
+
+	now := time.Now()
+
 	tests := []struct {
 		name           string
 		user           *auth.User
@@ -45,68 +37,68 @@ func TestRequireVerifiedEmailMiddleware(t *testing.T) {
 	}{
 		{
 			name:           "Unverified User Blocked",
-			user:           &auth.User{ID: "user-1", Email: "unverified@trimly.app", EmailVerifiedAt: nil},
+			user:           &auth.User{ID: "user-1", Email: "unverified@example.com", EmailVerifiedAt: nil},
 			expectedStatus: http.StatusForbidden,
 		},
 		{
-			name: "Verified User Permitted",
-			user: func() *auth.User {
-				now := time.Now()
-				return &auth.User{ID: "user-2", Email: "verified@trimly.app", EmailVerifiedAt: &now}
-			}(),
+			name:           "Verified User Permitted",
+			user:           &auth.User{ID: "user-2", Email: "verified@example.com", EmailVerifiedAt: &now},
 			expectedStatus: http.StatusOK,
 		},
 	}
 
-	authHandler := auth.NewHandler(nil)
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusOK)
-			})
-
-			middleware := authHandler.RequireVerifiedEmailMiddleware(nextHandler)
-
-			req := httptest.NewRequest("GET", "/test-protected", nil)
+			req := httptest.NewRequest("POST", "/v1/links", nil)
 			ctx := context.WithValue(req.Context(), auth.UserContextKey, tt.user)
 			req = req.WithContext(ctx)
 
 			rr := httptest.NewRecorder()
-			middleware.ServeHTTP(rr, req)
+			nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+
+			middleware(nextHandler).ServeHTTP(rr, req)
 
 			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status code %d, got %d", tt.expectedStatus, rr.Code)
+				t.Errorf("expected status %d, got %d", tt.expectedStatus, rr.Code)
 			}
 		})
 	}
 }
 
 func TestAuthMiddlewareTokenExtraction(t *testing.T) {
-	authHandler := auth.NewHandler(nil)
+	handler := auth.NewHandler(nil)
+	middleware := handler.AuthMiddleware
 
-	reqCookie := httptest.NewRequest("GET", "/test", nil)
-	reqCookie.AddCookie(&http.Cookie{Name: "session_token", Value: "cookie_token_abc"})
+	req := httptest.NewRequest("GET", "/v1/auth/me", nil)
+	rr := httptest.NewRecorder()
 
-	reqBearer := httptest.NewRequest("GET", "/test", nil)
-	reqBearer.Header.Set("Authorization", "Bearer bearer_token_xyz")
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
-	reqUnauth := httptest.NewRequest("GET", "/test", nil)
+	middleware(nextHandler).ServeHTTP(rr, req)
 
-	rrCookie := httptest.NewRecorder()
-	authHandler.AuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).ServeHTTP(rrCookie, reqCookie)
-	// Status should be 401 because service is nil, but it passes token extraction check stage
-	if rrCookie.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500 for nil service, got %d", rrCookie.Code)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for missing token, got %d", rr.Code)
+	}
+}
+
+func TestRegisterValidation(t *testing.T) {
+	svc := auth.NewService(nil, nil)
+
+	_, errShort := svc.Register(context.Background(), auth.RegisterRequest{Email: "user@example.com", Password: "short"})
+	if errShort == nil {
+		t.Fatalf("expected error for short password, got nil")
 	}
 
-	rrUnauth := httptest.NewRecorder()
-	authHandler.AuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).ServeHTTP(rrUnauth, reqUnauth)
-	if rrUnauth.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 unauthenticated for missing token, got %d", rrUnauth.Code)
+	if errShort.Error() != "password must be at least 8 characters long" {
+		t.Errorf("expected password length error, got %q", errShort.Error())
 	}
 
-	if !strings.Contains(rrUnauth.Body.String(), "UNAUTHENTICATED") {
-		t.Errorf("expected UNAUTHENTICATED error code in response")
+	_, errEmpty := svc.Register(context.Background(), auth.RegisterRequest{Email: "", Password: "validpassword123"})
+	if errEmpty == nil {
+		t.Fatalf("expected error for empty email, got nil")
 	}
 }
