@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 
+	"trimly-platform/internal/admin"
 	"trimly-platform/internal/auth"
 	"trimly-platform/internal/config"
 	"trimly-platform/internal/link"
@@ -44,9 +45,14 @@ func main() {
 	workspaceService := workspace.NewService(workspaceRepo)
 	workspaceHandler := workspace.NewHandler(workspaceService)
 
-	// Link Module
+	// Admin Module
+	adminRepo := admin.NewRepository(dbPool)
+	adminService := admin.NewService(adminRepo)
+	adminHandler := admin.NewHandler(adminService)
+
+	// Link Module (Injected with AdminService as DomainBlacklistChecker)
 	linkRepo := link.NewRepository(dbPool)
-	linkService := link.NewService(linkRepo)
+	linkService := link.NewService(linkRepo, adminService)
 	linkHandler := link.NewHandler(linkService)
 
 	// Router
@@ -69,15 +75,20 @@ func main() {
 	mux.HandleFunc("POST /v1/auth/login", authHandler.Login)
 	mux.HandleFunc("POST /v1/auth/logout", authHandler.Logout)
 
-	// Protected Routes (Session Auth + Verified Email required)
-	verifiedAuthChain := func(handler http.HandlerFunc) http.Handler {
-		return authHandler.AuthMiddleware(authHandler.RequireVerifiedEmailMiddleware(http.HandlerFunc(handler)))
-	}
-
+	// Middleware Chains
 	authChain := func(handler http.HandlerFunc) http.Handler {
 		return authHandler.AuthMiddleware(http.HandlerFunc(handler))
 	}
 
+	verifiedAuthChain := func(handler http.HandlerFunc) http.Handler {
+		return authHandler.AuthMiddleware(authHandler.RequireVerifiedEmailMiddleware(http.HandlerFunc(handler)))
+	}
+
+	adminChain := func(handler http.HandlerFunc) http.Handler {
+		return authHandler.AuthMiddleware(adminService.RequirePlatformAdminMiddleware(http.HandlerFunc(handler)))
+	}
+
+	// User Profile
 	mux.Handle("GET /v1/auth/me", authChain(func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value(auth.UserContextKey).(*auth.User)
 		httputil.RespondJSON(w, http.StatusOK, user)
@@ -91,6 +102,12 @@ func main() {
 	mux.Handle("POST /v1/workspaces", authChain(workspaceHandler.CreateWorkspace))
 	mux.Handle("GET /v1/workspaces", authChain(workspaceHandler.ListWorkspaces))
 	mux.Handle("POST /v1/workspaces/members", authChain(workspaceHandler.AddMember))
+
+	// Minimal Platform Admin Endpoints
+	mux.Handle("GET /v1/admin/users", adminChain(adminHandler.ListUsers))
+	mux.Handle("POST /v1/admin/blacklist-domains", adminChain(adminHandler.AddBlacklistDomain))
+	mux.Handle("DELETE /v1/admin/blacklist-domains/", adminChain(adminHandler.RemoveBlacklistDomain))
+	mux.Handle("POST /v1/admin/clicks/unflag", adminChain(adminHandler.UnflagClick))
 
 	log.Printf("Trimly Platform API server running on port :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
