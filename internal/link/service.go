@@ -13,20 +13,26 @@ import (
 	"trimly-platform/internal/auth"
 )
 
+type DomainBlacklistChecker interface {
+	IsDomainBlacklisted(ctx context.Context, domain string) bool
+}
+
 type clickTask struct {
 	linkID string
 	source string
 }
 
 type Service struct {
-	repo      *Repository
-	clickChan chan clickTask
+	repo             *Repository
+	blacklistChecker DomainBlacklistChecker
+	clickChan        chan clickTask
 }
 
-func NewService(repo *Repository) *Service {
+func NewService(repo *Repository, blacklistChecker DomainBlacklistChecker) *Service {
 	s := &Service{
-		repo:      repo,
-		clickChan: make(chan clickTask, 5000), // Buffer 5000 events for NFR-3 high throughput
+		repo:             repo,
+		blacklistChecker: blacklistChecker,
+		clickChan:        make(chan clickTask, 5000),
 	}
 	go s.startClickWorker()
 	return s
@@ -54,12 +60,19 @@ func (s *Service) CreateLink(ctx context.Context, user *auth.User, req CreateLin
 		return nil, errors.New("target_url is required")
 	}
 
-	_, err := url.ParseRequestURI(req.TargetURL)
+	parsedURL, err := url.ParseRequestURI(req.TargetURL)
 	if err != nil {
 		return nil, errors.New("invalid target_url format")
 	}
 
-	// Enforcement PRD FR-4 & AC-5: Custom alias prohibited for Free plan
+	// Enforcement PRD FR-38 & AC-34: Check domain blacklist
+	if s.blacklistChecker != nil {
+		domain := strings.ToLower(parsedURL.Hostname())
+		if s.blacklistChecker.IsDomainBlacklisted(ctx, domain) {
+			return nil, errors.New("target_url domain is blacklisted and cannot be shortened")
+		}
+	}
+
 	slug := strings.TrimSpace(req.CustomAlias)
 	if slug != "" {
 		if user.PlanCode == "FREE" {
@@ -72,12 +85,11 @@ func (s *Service) CreateLink(ctx context.Context, user *auth.User, req CreateLin
 		slug = generateRandomSlug(7)
 	}
 
-	// Enforcement PRD FR-5: Expiry dates prohibited for Free plan
 	if req.ExpiresAt != nil && user.PlanCode == "FREE" {
 		return nil, errors.New("expiry time is only available on Pro or Business plans")
 	}
 
-	return s.repo.CreateLinkAtomic(ctx, user.ID, req.WorkspaceID, slug, req.TargetURL, user.PlanCode, req.ExpiresAt)
+	return s.repo.CreateLinkAtomic(ctx, user.ID, req.WorkspaceID, slug, req.TargetURL, user.PlanCode, req.ExpiresAt, req.UTM)
 }
 
 func (s *Service) ResolveAndRecordRedirect(ctx context.Context, slug, source string) (string, error) {
@@ -86,7 +98,6 @@ func (s *Service) ResolveAndRecordRedirect(ctx context.Context, slug, source str
 		return "", err
 	}
 
-	// Non-blocking async click ingestion for NFR-2 (<100ms p95 latency) & NFR-3 (500 concurrent events)
 	select {
 	case s.clickChan <- clickTask{linkID: link.ID, source: source}:
 	default:

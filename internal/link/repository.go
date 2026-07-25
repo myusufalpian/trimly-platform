@@ -17,14 +17,13 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
-func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, workspaceID *string, slug, targetURL, userPlan string, expiresAt *time.Time) (*Link, error) {
+func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, workspaceID *string, slug, targetURL, userPlan string, expiresAt *time.Time, utm *LinkCampaign) (*Link, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
-	// Lock user plan usage row to prevent race conditions
 	var activeCount int
 	var planCode string
 	lockQuery := `
@@ -36,7 +35,6 @@ func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, w
 		return nil, err
 	}
 
-	// Enforcement PRD FR-2 & AC-2: Free plan maximum 10 active links
 	if planCode == "FREE" && activeCount >= 10 {
 		return nil, errors.New("active link limit reached for Free plan (maximum 10 active links)")
 	}
@@ -54,7 +52,19 @@ func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, w
 		return nil, err
 	}
 
-	// Increment active link count
+	// Insert UTM Campaign metadata if provided (FR-23)
+	if utm != nil {
+		utmQuery := `
+			INSERT INTO link_campaigns (link_id, utm_source, utm_medium, utm_campaign, utm_term, utm_content)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`
+		_, err = tx.Exec(ctx, utmQuery, link.ID, utm.UTMSource, utm.UTMMedium, utm.UTMCampaign, utm.UTMTerm, utm.UTMContent)
+		if err != nil {
+			return nil, err
+		}
+		link.UTMCampaign = utm
+	}
+
 	_, err = tx.Exec(ctx, `UPDATE plan_usage SET active_link_count = active_link_count + 1 WHERE user_id = $1`, ownerUserID)
 	if err != nil {
 		return nil, err
@@ -132,10 +142,35 @@ func (r *Repository) GetLinkAnalytics(ctx context.Context, linkID, userPlan stri
 		}
 	}
 
-	return &AnalyticsSummary{
+	summary := &AnalyticsSummary{
 		TotalClicks: totalClicks,
 		DailyClicks: points,
-	}, nil
+	}
+
+	// Gated breakdown analytics per campaign (FR-24 / AC-26: Pro & Business only)
+	if userPlan == "PRO" || userPlan == "BUSINESS" {
+		breakdownQuery := `
+			SELECT COALESCE(lc.utm_source, 'none') as utm_source, COALESCE(lc.utm_campaign, 'none') as utm_campaign, COUNT(*) as click_count
+			FROM click_events ce
+			JOIN link_campaigns lc ON ce.link_id = lc.link_id
+			WHERE ce.link_id = $1 AND ce.clicked_at >= $2
+			GROUP BY lc.utm_source, lc.utm_campaign
+		`
+		breakdownRows, err := r.db.Query(ctx, breakdownQuery, linkID, cutoffDate)
+		if err == nil {
+			defer breakdownRows.Close()
+			var breakdown []CampaignBreakdownRow
+			for breakdownRows.Next() {
+				var b CampaignBreakdownRow
+				if err := breakdownRows.Scan(&b.UTMSource, &b.UTMCampaign, &b.ClickCount); err == nil {
+					breakdown = append(breakdown, b)
+				}
+			}
+			summary.CampaignBreakdown = breakdown
+		}
+	}
+
+	return summary, nil
 }
 
 func (r *Repository) GetUserActiveLinkCount(ctx context.Context, userID string) (int, error) {

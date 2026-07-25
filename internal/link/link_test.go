@@ -9,8 +9,25 @@ import (
 	"trimly-platform/internal/link"
 )
 
+type mockBlacklistChecker struct {
+	blacklistedDomains map[string]bool
+}
+
+func (m *mockBlacklistChecker) IsDomainBlacklisted(ctx context.Context, domain string) bool {
+	if m.blacklistedDomains == nil {
+		return false
+	}
+	return m.blacklistedDomains[domain]
+}
+
 func TestCreateLinkValidations(t *testing.T) {
-	svc := link.NewService(nil)
+	mockChecker := &mockBlacklistChecker{
+		blacklistedDomains: map[string]bool{
+			"malicious.com": true,
+		},
+	}
+
+	svc := link.NewService(nil, mockChecker)
 
 	userFree := &auth.User{ID: "user-free-1", PlanCode: "FREE"}
 	userPro := &auth.User{ID: "user-pro-1", PlanCode: "PRO"}
@@ -34,6 +51,12 @@ func TestCreateLinkValidations(t *testing.T) {
 			user:          userFree,
 			req:           link.CreateLinkRequest{TargetURL: "invalid-url-string"},
 			expectedError: "invalid target_url format",
+		},
+		{
+			name:          "Blacklisted Domain Target URL",
+			user:          userFree,
+			req:           link.CreateLinkRequest{TargetURL: "https://malicious.com/phishing"},
+			expectedError: "target_url domain is blacklisted and cannot be shortened",
 		},
 		{
 			name:          "Custom Alias Prohibited for Free Plan",
@@ -65,9 +88,8 @@ func TestCreateLinkValidations(t *testing.T) {
 }
 
 func TestCheckDowngradeAllowedValidation(t *testing.T) {
-	svc := link.NewService(nil)
+	svc := link.NewService(nil, nil)
 
-	// When downgrading to non-FREE plan (e.g. PRO), no active count check required
 	err := svc.CheckDowngradeAllowed(context.Background(), "user-1", "PRO")
 	if err != nil {
 		t.Errorf("expected no error for PRO downgrade, got %v", err)
