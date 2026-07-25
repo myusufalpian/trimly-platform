@@ -1,0 +1,12 @@
+.git
+.gitignore
+.github
+.env
+*.out
+*.log
+kiro-task
+docs
+tmp
+docker-compose.yml
+README.md
+project_context.md
