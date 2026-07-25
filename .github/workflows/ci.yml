@@ -2,7 +2,7 @@ name: Trimly Platform CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, "feature/**" ]
   pull_request:
     branches: [ master ]
 
@@ -18,7 +18,7 @@ jobs:
       - name: Setup Go Environment
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
           cache: true
 
       - name: Install Dependencies
@@ -42,7 +42,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build Docker Image (Verify Dockerfile)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
