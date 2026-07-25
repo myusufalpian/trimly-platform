@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"trimly-platform/internal/admin"
+	"trimly-platform/internal/apikey"
 	"trimly-platform/internal/auth"
 	"trimly-platform/internal/config"
 	"trimly-platform/internal/link"
@@ -50,6 +51,11 @@ func main() {
 	adminService := admin.NewService(adminRepo)
 	adminHandler := admin.NewHandler(adminService)
 
+	// API Key Module (Rilis 2 B2B)
+	apiKeyRepo := apikey.NewRepository(dbPool)
+	apiKeyService := apikey.NewService(apiKeyRepo)
+	apiKeyHandler := apikey.NewHandler(apiKeyService)
+
 	// Link Module (Injected with AdminService as DomainBlacklistChecker)
 	linkRepo := link.NewRepository(dbPool)
 	linkService := link.NewService(linkRepo, adminService)
@@ -88,13 +94,17 @@ func main() {
 		return authHandler.AuthMiddleware(adminService.RequirePlatformAdminMiddleware(http.HandlerFunc(handler)))
 	}
 
+	apiKeyChain := func(handler http.HandlerFunc) http.Handler {
+		return apiKeyService.APIKeyAuthMiddleware(http.HandlerFunc(handler))
+	}
+
 	// User Profile
 	mux.Handle("GET /v1/auth/me", authChain(func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value(auth.UserContextKey).(*auth.User)
 		httputil.RespondJSON(w, http.StatusOK, user)
 	}))
 
-	// Link Protected Endpoints
+	// Link Protected Endpoints (Web Session)
 	mux.Handle("POST /v1/links", verifiedAuthChain(linkHandler.CreateLink))
 	mux.Handle("GET /v1/links/analytics", authChain(linkHandler.GetAnalytics))
 
@@ -108,6 +118,15 @@ func main() {
 	mux.Handle("POST /v1/admin/blacklist-domains", adminChain(adminHandler.AddBlacklistDomain))
 	mux.Handle("DELETE /v1/admin/blacklist-domains/", adminChain(adminHandler.RemoveBlacklistDomain))
 	mux.Handle("POST /v1/admin/clicks/unflag", adminChain(adminHandler.UnflagClick))
+
+	// Rilis 2: B2B API Key Management & B2B Link Creation
+	mux.Handle("POST /v1/api-keys", authChain(apiKeyHandler.CreateAPIKey))
+	mux.Handle("GET /v1/api-keys", authChain(apiKeyHandler.ListAPIKeys))
+	mux.Handle("DELETE /v1/api-keys/", authChain(apiKeyHandler.RevokeAPIKey))
+	mux.Handle("GET /v1/api-usage", authChain(apiKeyHandler.GetUsageHistory))
+
+	// B2B Integrator Link Creation Endpoint (Authenticated via API Key & Rate Limited 60/min + 5000/day)
+	mux.Handle("POST /v1/api/links", apiKeyChain(linkHandler.CreateLink))
 
 	log.Printf("Trimly Platform API server running on port :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
