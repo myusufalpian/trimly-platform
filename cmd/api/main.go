@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
-	"log"
+	"errors"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"trimly-platform/internal/admin"
 	"trimly-platform/internal/apikey"
@@ -18,19 +23,27 @@ import (
 )
 
 func main() {
+	// Initialize Structured Logger (log/slog JSON Handler)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	cfg := config.LoadConfig()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("Unable to connect to database: %v", err)
+		slog.Error("Unable to connect to database", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
-	defer dbPool.Close()
 
 	if err := dbPool.Ping(ctx); err != nil {
-		log.Printf("Warning: Database ping failed: %v", err)
+		slog.Warn("Database ping warning", slog.String("error", err.Error()))
 	} else {
-		log.Println("Successfully connected to PostgreSQL database")
+		slog.Info("Successfully connected to PostgreSQL database")
 	}
 
 	// Adapters
@@ -64,11 +77,36 @@ func main() {
 	// Router
 	mux := http.NewServeMux()
 
-	// Health Check
+	// TASK-701: Health Check (Liveness Probe)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		httputil.RespondJSON(w, http.StatusOK, map[string]string{
+			"status":  "ok",
+			"service": "trimly-platform",
+		})
+	})
+
+	// Legacy /health compatibility
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		httputil.RespondJSON(w, http.StatusOK, map[string]string{
 			"status":  "ok",
 			"service": "trimly-platform",
+		})
+	})
+
+	// TASK-701: Readiness Probe (Checks Database Connection Ping)
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		pingCtx, pingCancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer pingCancel()
+
+		if err := dbPool.Ping(pingCtx); err != nil {
+			slog.Error("Readiness check failed - DB ping error", slog.String("error", err.Error()))
+			httputil.RespondError(w, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "Database connection unhealthy")
+			return
+		}
+
+		httputil.RespondJSON(w, http.StatusOK, map[string]string{
+			"status":   "ready",
+			"database": "connected",
 		})
 	})
 
@@ -128,8 +166,44 @@ func main() {
 	// B2B Integrator Link Creation Endpoint (Authenticated via API Key & Rate Limited 60/min + 5000/day)
 	mux.Handle("POST /v1/api/links", apiKeyChain(linkHandler.CreateLink))
 
-	log.Printf("Trimly Platform API server running on port :%s", cfg.Port)
-	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
-		log.Fatalf("Server failed to start: %v", err)
+	// Wrap entire Mux with TASK-702 Request Logger Middleware
+	loggedHandler := httputil.RequestLoggerMiddleware(mux)
+
+	// HTTP Server Configuration
+	server := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      loggedHandler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
+
+	// TASK-703: Graceful Shutdown Setup
+	stopChan := make(chan os.Signal, 1)
+	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		slog.Info("Trimly Platform API server running", slog.String("port", cfg.Port))
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Server failed unexpectedly", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for termination signal
+	sig := <-stopChan
+	slog.Info("Received shutdown signal", slog.String("signal", sig.String()))
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Server forced to shutdown", slog.String("error", err.Error()))
+	} else {
+		slog.Info("HTTP server gracefully stopped")
+	}
+
+	// Close Database Pool cleanly
+	dbPool.Close()
+	slog.Info("Database pool connection closed cleanly")
 }
