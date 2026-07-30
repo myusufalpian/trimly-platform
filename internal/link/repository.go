@@ -185,3 +185,65 @@ func (r *Repository) IsSlugAvailable(ctx context.Context, slug string) bool {
 	err := r.db.QueryRow(ctx, `SELECT 1 FROM links WHERE slug = $1 AND deleted_at IS NULL`, slug).Scan(&dummy)
 	return err == pgx.ErrNoRows
 }
+
+func (r *Repository) GetLinkByID(ctx context.Context, linkID string) (*Link, error) {
+	link := &Link{}
+	query := `
+		SELECT id, owner_user_id, workspace_id, slug, target_url, status, expires_at, created_at, updated_at
+		FROM links
+		WHERE id = $1 AND deleted_at IS NULL
+	`
+	err := r.db.QueryRow(ctx, query, linkID).Scan(
+		&link.ID, &link.OwnerUserID, &link.WorkspaceID, &link.Slug, &link.TargetURL, &link.Status, &link.ExpiresAt, &link.CreatedAt, &link.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errors.New("shortlink not found")
+		}
+		return nil, err
+	}
+	return link, nil
+}
+
+type ClickExportRow struct {
+	Timestamp string
+	Slug      string
+	Country   string
+	Referrer  string
+	UserAgent string
+	Device    string
+}
+
+func (r *Repository) GetExportAnalytics(ctx context.Context, linkID string) ([]ClickExportRow, error) {
+	query := `
+		SELECT 
+			ce.clicked_at::text as timestamp,
+			l.slug,
+			COALESCE(ce.source, 'UNKNOWN') as country,
+			'direct' as referrer,
+			'unknown' as user_agent,
+			'desktop' as device
+		FROM click_events ce
+		JOIN links l ON ce.link_id = l.id
+		WHERE ce.link_id = $1
+		ORDER BY ce.clicked_at DESC
+	`
+	rows, err := r.db.Query(ctx, query, linkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []ClickExportRow
+	for rows.Next() {
+		var row ClickExportRow
+		if err := rows.Scan(&row.Timestamp, &row.Slug, &row.Country, &row.Referrer, &row.UserAgent, &row.Device); err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}

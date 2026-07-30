@@ -145,6 +145,8 @@ func main() {
 	// Link Protected Endpoints (Web Session)
 	mux.Handle("POST /v1/links", verifiedAuthChain(linkHandler.CreateLink))
 	mux.Handle("GET /v1/links/analytics", authChain(linkHandler.GetAnalytics))
+	mux.Handle("GET /v1/links/qr", authChain(linkHandler.GenerateQRCode))
+	mux.Handle("GET /v1/analytics/export", authChain(linkHandler.ExportCSVAnalytics))
 
 	// Workspace Protected Endpoints
 	mux.Handle("POST /v1/workspaces", authChain(workspaceHandler.CreateWorkspace))

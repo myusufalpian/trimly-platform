@@ -1,8 +1,10 @@
 package link
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/csv"
 	"encoding/hex"
 	"errors"
 	"log"
@@ -11,6 +13,8 @@ import (
 	"time"
 
 	"trimly-platform/internal/auth"
+
+	"github.com/skip2/go-qrcode"
 )
 
 type DomainBlacklistChecker interface {
@@ -122,4 +126,60 @@ func (s *Service) CheckDowngradeAllowed(ctx context.Context, userID, newPlan str
 		}
 	}
 	return nil
+}
+
+func (s *Service) GenerateQRCode(ctx context.Context, user *auth.User, linkID, baseURL string) ([]byte, error) {
+	link, err := s.repo.GetLinkByID(ctx, linkID)
+	if err != nil {
+		return nil, err
+	}
+
+	if link.OwnerUserID != user.ID {
+		return nil, errors.New("unauthorized access to shortlink QR code")
+	}
+
+	targetURL := strings.TrimRight(baseURL, "/") + "/r/" + link.Slug
+	pngBytes, err := qrcode.Encode(targetURL, qrcode.Medium, 256)
+	if err != nil {
+		return nil, errors.New("failed to generate QR code PNG")
+	}
+
+	return pngBytes, nil
+}
+
+func (s *Service) ExportCSVAnalytics(ctx context.Context, user *auth.User, linkID string) ([]byte, error) {
+	if user.PlanCode != "PRO" && user.PlanCode != "BUSINESS" {
+		return nil, errors.New("CSV analytics export is only available on Pro or Business plans")
+	}
+
+	link, err := s.repo.GetLinkByID(ctx, linkID)
+	if err != nil {
+		return nil, err
+	}
+
+	if link.OwnerUserID != user.ID {
+		return nil, errors.New("unauthorized access to shortlink analytics")
+	}
+
+	rows, err := s.repo.GetExportAnalytics(ctx, linkID)
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	writer := csv.NewWriter(&buf)
+
+	// Write CSV Header
+	_ = writer.Write([]string{"timestamp", "slug", "country", "referrer", "user_agent", "device"})
+
+	for _, r := range rows {
+		_ = writer.Write([]string{r.Timestamp, r.Slug, r.Country, r.Referrer, r.UserAgent, r.Device})
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
