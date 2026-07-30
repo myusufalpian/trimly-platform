@@ -13,10 +13,12 @@ import (
 	"trimly-platform/internal/admin"
 	"trimly-platform/internal/apikey"
 	"trimly-platform/internal/auth"
+	"trimly-platform/internal/bio"
 	"trimly-platform/internal/config"
 	"trimly-platform/internal/link"
 	"trimly-platform/internal/pkg/httputil"
 	"trimly-platform/internal/pkg/mail"
+	"trimly-platform/internal/security"
 	"trimly-platform/internal/workspace"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -72,7 +74,13 @@ func main() {
 	// Link Module (Injected with AdminService as DomainBlacklistChecker)
 	linkRepo := link.NewRepository(dbPool)
 	linkService := link.NewService(linkRepo, adminService)
+	linkService.SetURLScanner(security.NewMockURLScanner(cfg.ThreatDomains...))
 	linkHandler := link.NewHandler(linkService)
+
+	// Link-in-Bio Module
+	bioRepo := bio.NewRepository(dbPool)
+	bioService := bio.NewService(bioRepo)
+	bioHandler := bio.NewHandler(bioService)
 
 	// Router
 	mux := http.NewServeMux()
@@ -144,6 +152,9 @@ func main() {
 
 	// Link Protected Endpoints (Web Session)
 	mux.Handle("POST /v1/links", verifiedAuthChain(linkHandler.CreateLink))
+	mux.Handle("POST /v1/bio-pages", authChain(bioHandler.CreatePage))
+	mux.Handle("POST /v1/bio-pages/{id}/links", authChain(bioHandler.AddLink))
+	mux.HandleFunc("GET /v1/bio-pages/public/{slug}", bioHandler.PublicPage)
 	mux.Handle("GET /v1/links/analytics", authChain(linkHandler.GetAnalytics))
 	mux.Handle("GET /v1/links/qr", authChain(linkHandler.GenerateQRCode))
 	mux.Handle("GET /v1/analytics/export", authChain(linkHandler.ExportCSVAnalytics))

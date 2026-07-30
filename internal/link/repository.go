@@ -17,7 +17,7 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
-func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, workspaceID *string, slug, targetURL, userPlan string, expiresAt *time.Time, utm *LinkCampaign) (*Link, error) {
+func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, workspaceID *string, slug, targetURL, customDomain, userPlan string, expiresAt *time.Time, utm *LinkCampaign) (*Link, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -41,12 +41,12 @@ func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, w
 
 	link := &Link{}
 	insertQuery := `
-		INSERT INTO links (owner_user_id, workspace_id, slug, target_url, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, owner_user_id, workspace_id, slug, target_url, status, expires_at, created_at, updated_at
+		INSERT INTO links (owner_user_id, workspace_id, slug, target_url, custom_domain, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, owner_user_id, workspace_id, slug, target_url, custom_domain, status, expires_at, created_at, updated_at
 	`
-	err = tx.QueryRow(ctx, insertQuery, ownerUserID, workspaceID, slug, targetURL, expiresAt).Scan(
-		&link.ID, &link.OwnerUserID, &link.WorkspaceID, &link.Slug, &link.TargetURL, &link.Status, &link.ExpiresAt, &link.CreatedAt, &link.UpdatedAt,
+	err = tx.QueryRow(ctx, insertQuery, ownerUserID, workspaceID, slug, targetURL, customDomain, expiresAt).Scan(
+		&link.ID, &link.OwnerUserID, &link.WorkspaceID, &link.Slug, &link.TargetURL, &link.CustomDomain, &link.Status, &link.ExpiresAt, &link.CreatedAt, &link.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -80,12 +80,12 @@ func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, w
 func (r *Repository) GetActiveLinkBySlug(ctx context.Context, slug string) (*Link, error) {
 	link := &Link{}
 	query := `
-		SELECT id, owner_user_id, workspace_id, slug, target_url, status, expires_at, created_at, updated_at
+		SELECT id, owner_user_id, workspace_id, slug, target_url, custom_domain, status, expires_at, created_at, updated_at
 		FROM links
 		WHERE slug = $1 AND status = 'ACTIVE' AND deleted_at IS NULL
 	`
 	err := r.db.QueryRow(ctx, query, slug).Scan(
-		&link.ID, &link.OwnerUserID, &link.WorkspaceID, &link.Slug, &link.TargetURL, &link.Status, &link.ExpiresAt, &link.CreatedAt, &link.UpdatedAt,
+		&link.ID, &link.OwnerUserID, &link.WorkspaceID, &link.Slug, &link.TargetURL, &link.CustomDomain, &link.Status, &link.ExpiresAt, &link.CreatedAt, &link.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -189,16 +189,16 @@ func (r *Repository) IsSlugAvailable(ctx context.Context, slug string) bool {
 func (r *Repository) GetLinkByID(ctx context.Context, linkID string) (*Link, error) {
 	link := &Link{}
 	query := `
-		SELECT id, owner_user_id, workspace_id, slug, target_url, status, expires_at, created_at, updated_at
+		SELECT id, owner_user_id, workspace_id, slug, target_url, custom_domain, status, expires_at, created_at, updated_at
 		FROM links
 		WHERE id = $1 AND deleted_at IS NULL
 	`
 	err := r.db.QueryRow(ctx, query, linkID).Scan(
-		&link.ID, &link.OwnerUserID, &link.WorkspaceID, &link.Slug, &link.TargetURL, &link.Status, &link.ExpiresAt, &link.CreatedAt, &link.UpdatedAt,
+		&link.ID, &link.OwnerUserID, &link.WorkspaceID, &link.Slug, &link.TargetURL, &link.CustomDomain, &link.Status, &link.ExpiresAt, &link.CreatedAt, &link.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errors.New("shortlink not found")
+			return nil, ErrLinkNotFound
 		}
 		return nil, err
 	}

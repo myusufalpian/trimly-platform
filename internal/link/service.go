@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"trimly-platform/internal/auth"
+	"trimly-platform/internal/security"
 
 	"github.com/skip2/go-qrcode"
 )
@@ -20,6 +21,14 @@ import (
 type DomainBlacklistChecker interface {
 	IsDomainBlacklisted(ctx context.Context, domain string) bool
 }
+
+var (
+	ErrMaliciousURL     = errors.New("MALICIOUS_URL_DETECTED")
+	ErrCustomDomainPlan = errors.New("custom domain is only available on Business plans")
+	ErrLinkNotFound     = errors.New("shortlink not found")
+	ErrLinkUnauthorized = errors.New("unauthorized access to shortlink")
+	ErrCSVPlan          = errors.New("CSV analytics export is only available on Pro or Business plans")
+)
 
 type clickTask struct {
 	linkID string
@@ -29,6 +38,7 @@ type clickTask struct {
 type Service struct {
 	repo             *Repository
 	blacklistChecker DomainBlacklistChecker
+	scanner          security.URLScanner
 	clickChan        chan clickTask
 }
 
@@ -41,6 +51,8 @@ func NewService(repo *Repository, blacklistChecker DomainBlacklistChecker) *Serv
 	go s.startClickWorker()
 	return s
 }
+
+func (s *Service) SetURLScanner(scanner security.URLScanner) { s.scanner = scanner }
 
 func (s *Service) startClickWorker() {
 	for task := range s.clickChan {
@@ -68,6 +80,18 @@ func (s *Service) CreateLink(ctx context.Context, user *auth.User, req CreateLin
 	if err != nil {
 		return nil, errors.New("invalid target_url format")
 	}
+	if s.scanner != nil {
+		malicious, scanErr := s.scanner.CheckURL(ctx, req.TargetURL)
+		if scanErr != nil {
+			return nil, errors.New("unable to scan target_url")
+		}
+		if malicious {
+			return nil, ErrMaliciousURL
+		}
+	}
+	if req.CustomDomain != "" && user.PlanCode != "BUSINESS" {
+		return nil, ErrCustomDomainPlan
+	}
 
 	// Enforcement PRD FR-38 & AC-34: Check domain blacklist
 	if s.blacklistChecker != nil {
@@ -93,7 +117,7 @@ func (s *Service) CreateLink(ctx context.Context, user *auth.User, req CreateLin
 		return nil, errors.New("expiry time is only available on Pro or Business plans")
 	}
 
-	return s.repo.CreateLinkAtomic(ctx, user.ID, req.WorkspaceID, slug, req.TargetURL, user.PlanCode, req.ExpiresAt, req.UTM)
+	return s.repo.CreateLinkAtomic(ctx, user.ID, req.WorkspaceID, slug, req.TargetURL, req.CustomDomain, user.PlanCode, req.ExpiresAt, req.UTM)
 }
 
 func (s *Service) ResolveAndRecordRedirect(ctx context.Context, slug, source string) (string, error) {
@@ -135,7 +159,7 @@ func (s *Service) GenerateQRCode(ctx context.Context, user *auth.User, linkID, b
 	}
 
 	if link.OwnerUserID != user.ID {
-		return nil, errors.New("unauthorized access to shortlink QR code")
+		return nil, ErrLinkUnauthorized
 	}
 
 	targetURL := strings.TrimRight(baseURL, "/") + "/r/" + link.Slug
@@ -149,7 +173,7 @@ func (s *Service) GenerateQRCode(ctx context.Context, user *auth.User, linkID, b
 
 func (s *Service) ExportCSVAnalytics(ctx context.Context, user *auth.User, linkID string) ([]byte, error) {
 	if user.PlanCode != "PRO" && user.PlanCode != "BUSINESS" {
-		return nil, errors.New("CSV analytics export is only available on Pro or Business plans")
+		return nil, ErrCSVPlan
 	}
 
 	link, err := s.repo.GetLinkByID(ctx, linkID)
@@ -158,7 +182,7 @@ func (s *Service) ExportCSVAnalytics(ctx context.Context, user *auth.User, linkI
 	}
 
 	if link.OwnerUserID != user.ID {
-		return nil, errors.New("unauthorized access to shortlink analytics")
+		return nil, ErrLinkUnauthorized
 	}
 
 	rows, err := s.repo.GetExportAnalytics(ctx, linkID)

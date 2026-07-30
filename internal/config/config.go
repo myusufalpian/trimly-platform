@@ -2,13 +2,15 @@ package config
 
 import (
 	"os"
+	"strings"
 )
 
 type Config struct {
-	Port        string
-	DatabaseURL string
-	SMTPHost    string
-	SMTPPort    string
+	Port          string
+	DatabaseURL   string
+	SMTPHost      string
+	SMTPPort      string
+	ThreatDomains []string
 }
 
 func LoadConfig() *Config {
@@ -31,11 +33,21 @@ func LoadConfig() *Config {
 	if smtpPort == "" {
 		smtpPort = "1025"
 	}
+	var threatDomains []string
+	for _, domain := range strings.Split(os.Getenv("THREAT_DOMAINS"), ",") {
+		if domain = strings.TrimSpace(strings.ToLower(domain)); domain != "" {
+			threatDomains = append(threatDomains, domain)
+		}
+	}
+	if len(threatDomains) == 0 {
+		threatDomains = []string{"malicious.com", "phishing.com"}
+	}
 
 	return &Config{
-		Port:        port,
-		DatabaseURL: dbURL,
-		SMTPHost:    smtpHost,
-		SMTPPort:    smtpPort,
+		Port:          port,
+		DatabaseURL:   dbURL,
+		SMTPHost:      smtpHost,
+		SMTPPort:      smtpPort,
+		ThreatDomains: threatDomains,
 	}
 }

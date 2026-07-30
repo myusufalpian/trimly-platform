@@ -2,6 +2,7 @@ package link
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -19,7 +20,11 @@ func NewHandler(service *Service) *Handler {
 
 func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	user := r.Context().Value(auth.UserContextKey).(*auth.User)
+	user, ok := r.Context().Value(auth.UserContextKey).(*auth.User)
+	if !ok || user == nil {
+		httputil.RespondError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
 
 	var req CreateLinkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -29,6 +34,14 @@ func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 
 	link, err := h.service.CreateLink(r.Context(), user, req)
 	if err != nil {
+		if errors.Is(err, ErrMaliciousURL) {
+			httputil.RespondError(w, http.StatusBadRequest, "MALICIOUS_URL_DETECTED", "The provided target URL poses a security threat and cannot be shortened.")
+			return
+		}
+		if errors.Is(err, ErrCustomDomainPlan) {
+			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
+			return
+		}
 		httputil.RespondError(w, http.StatusBadRequest, "CREATE_LINK_FAILED", err.Error())
 		return
 	}
@@ -54,7 +67,11 @@ func (h *Handler) PublicRedirect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetAnalytics(w http.ResponseWriter, r *http.Request) {
-	user := r.Context().Value(auth.UserContextKey).(*auth.User)
+	user, ok := r.Context().Value(auth.UserContextKey).(*auth.User)
+	if !ok || user == nil {
+		httputil.RespondError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
 	linkID := r.URL.Query().Get("link_id")
 	if linkID == "" {
 		httputil.RespondError(w, http.StatusBadRequest, "MISSING_PARAM", "link_id query parameter is required")
@@ -71,7 +88,11 @@ func (h *Handler) GetAnalytics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GenerateQRCode(w http.ResponseWriter, r *http.Request) {
-	user := r.Context().Value(auth.UserContextKey).(*auth.User)
+	user, ok := r.Context().Value(auth.UserContextKey).(*auth.User)
+	if !ok || user == nil {
+		httputil.RespondError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
 	linkID := r.URL.Query().Get("link_id")
 	if linkID == "" {
 		httputil.RespondError(w, http.StatusBadRequest, "MISSING_PARAM", "link_id query parameter is required")
@@ -86,11 +107,11 @@ func (h *Handler) GenerateQRCode(w http.ResponseWriter, r *http.Request) {
 
 	pngBytes, err := h.service.GenerateQRCode(r.Context(), user, linkID, baseURL)
 	if err != nil {
-		if strings.Contains(err.Error(), "shortlink not found") {
+		if errors.Is(err, ErrLinkNotFound) {
 			httputil.RespondError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "unauthorized") {
+		if errors.Is(err, ErrLinkUnauthorized) {
 			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
 			return
 		}
@@ -104,7 +125,11 @@ func (h *Handler) GenerateQRCode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ExportCSVAnalytics(w http.ResponseWriter, r *http.Request) {
-	user := r.Context().Value(auth.UserContextKey).(*auth.User)
+	user, ok := r.Context().Value(auth.UserContextKey).(*auth.User)
+	if !ok || user == nil {
+		httputil.RespondError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
 	linkID := r.URL.Query().Get("link_id")
 	if linkID == "" {
 		httputil.RespondError(w, http.StatusBadRequest, "MISSING_PARAM", "link_id query parameter is required")
@@ -113,11 +138,11 @@ func (h *Handler) ExportCSVAnalytics(w http.ResponseWriter, r *http.Request) {
 
 	csvBytes, err := h.service.ExportCSVAnalytics(r.Context(), user, linkID)
 	if err != nil {
-		if strings.Contains(err.Error(), "shortlink not found") {
+		if errors.Is(err, ErrLinkNotFound) {
 			httputil.RespondError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "only available on Pro") {
+		if errors.Is(err, ErrLinkUnauthorized) || errors.Is(err, ErrCSVPlan) {
 			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
 			return
 		}
