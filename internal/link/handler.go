@@ -69,3 +69,64 @@ func (h *Handler) GetAnalytics(w http.ResponseWriter, r *http.Request) {
 
 	httputil.RespondJSON(w, http.StatusOK, analytics)
 }
+
+func (h *Handler) GenerateQRCode(w http.ResponseWriter, r *http.Request) {
+	user := r.Context().Value(auth.UserContextKey).(*auth.User)
+	linkID := r.URL.Query().Get("link_id")
+	if linkID == "" {
+		httputil.RespondError(w, http.StatusBadRequest, "MISSING_PARAM", "link_id query parameter is required")
+		return
+	}
+
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	baseURL := scheme + "://" + r.Host
+
+	pngBytes, err := h.service.GenerateQRCode(r.Context(), user, linkID, baseURL)
+	if err != nil {
+		if strings.Contains(err.Error(), "shortlink not found") {
+			httputil.RespondError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "unauthorized") {
+			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
+			return
+		}
+		httputil.RespondError(w, http.StatusBadRequest, "QR_GENERATE_FAILED", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(pngBytes)
+}
+
+func (h *Handler) ExportCSVAnalytics(w http.ResponseWriter, r *http.Request) {
+	user := r.Context().Value(auth.UserContextKey).(*auth.User)
+	linkID := r.URL.Query().Get("link_id")
+	if linkID == "" {
+		httputil.RespondError(w, http.StatusBadRequest, "MISSING_PARAM", "link_id query parameter is required")
+		return
+	}
+
+	csvBytes, err := h.service.ExportCSVAnalytics(r.Context(), user, linkID)
+	if err != nil {
+		if strings.Contains(err.Error(), "shortlink not found") {
+			httputil.RespondError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "only available on Pro") {
+			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
+			return
+		}
+		httputil.RespondError(w, http.StatusBadRequest, "EXPORT_FAILED", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", `attachment; filename="analytics_report.csv"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(csvBytes)
+}

@@ -95,3 +95,18 @@ func TestCheckDowngradeAllowedValidation(t *testing.T) {
 		t.Errorf("expected no error for PRO downgrade, got %v", err)
 	}
 }
+
+func TestExportCSVAnalyticsPlanGating(t *testing.T) {
+	svc := link.NewService(nil, nil)
+
+	userFree := &auth.User{ID: "user-free-1", PlanCode: "FREE"}
+	_, err := svc.ExportCSVAnalytics(context.Background(), userFree, "link-1")
+	if err == nil {
+		t.Fatalf("expected error for Free plan CSV export, got nil")
+	}
+
+	expectedErr := "CSV analytics export is only available on Pro or Business plans"
+	if err.Error() != expectedErr {
+		t.Errorf("expected error %q, got %q", expectedErr, err.Error())
+	}
+}
