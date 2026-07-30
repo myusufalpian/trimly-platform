@@ -12,16 +12,17 @@ const (
 )
 
 type Link struct {
-	ID          string        `json:"id"`
-	OwnerUserID string        `json:"owner_user_id"`
-	WorkspaceID *string       `json:"workspace_id,omitempty"`
-	Slug        string        `json:"slug"`
-	TargetURL   string        `json:"target_url"`
-	Status      LinkStatus    `json:"status"`
-	ExpiresAt   *time.Time    `json:"expires_at,omitempty"`
-	UTMCampaign *LinkCampaign `json:"utm_campaign,omitempty"`
-	CreatedAt   time.Time     `json:"created_at"`
-	UpdatedAt   time.Time     `json:"updated_at"`
+	ID           string        `json:"id"`
+	OwnerUserID  string        `json:"owner_user_id"`
+	WorkspaceID  *string       `json:"workspace_id,omitempty"`
+	Slug         string        `json:"slug"`
+	TargetURL    string        `json:"target_url"`
+	CustomDomain string        `json:"custom_domain,omitempty"`
+	Status       LinkStatus    `json:"status"`
+	ExpiresAt    *time.Time    `json:"expires_at,omitempty"`
+	UTMCampaign  *LinkCampaign `json:"utm_campaign,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"`
+	UpdatedAt    time.Time     `json:"updated_at"`
 }
 
 type LinkCampaign struct {
@@ -41,11 +42,12 @@ type ClickEvent struct {
 }
 
 type CreateLinkRequest struct {
-	TargetURL   string        `json:"target_url"`
-	CustomAlias string        `json:"custom_alias,omitempty"`
-	WorkspaceID *string       `json:"workspace_id,omitempty"`
-	ExpiresAt   *time.Time    `json:"expires_at,omitempty"`
-	UTM         *LinkCampaign `json:"utm,omitempty"`
+	TargetURL    string        `json:"target_url"`
+	CustomAlias  string        `json:"custom_alias,omitempty"`
+	WorkspaceID  *string       `json:"workspace_id,omitempty"`
+	ExpiresAt    *time.Time    `json:"expires_at,omitempty"`
+	UTM          *LinkCampaign `json:"utm,omitempty"`
+	CustomDomain string        `json:"custom_domain,omitempty"`
 }
 
 type AnalyticsSummary struct {

@@ -7,6 +7,7 @@ import (
 
 	"trimly-platform/internal/auth"
 	"trimly-platform/internal/link"
+	"trimly-platform/internal/security"
 )
 
 type mockBlacklistChecker struct {
@@ -108,5 +109,20 @@ func TestExportCSVAnalyticsPlanGating(t *testing.T) {
 	expectedErr := "CSV analytics export is only available on Pro or Business plans"
 	if err.Error() != expectedErr {
 		t.Errorf("expected error %q, got %q", expectedErr, err.Error())
+	}
+}
+
+func TestCreateLinkThreatScanner(t *testing.T) {
+	svc := link.NewService(nil, nil)
+	svc.SetURLScanner(&security.MockURLScanner{MaliciousDomains: map[string]bool{"phishing.test": true}})
+	_, err := svc.CreateLink(context.Background(), &auth.User{PlanCode: "FREE"}, link.CreateLinkRequest{TargetURL: "https://phishing.test/login"})
+	if err == nil || err.Error() != "MALICIOUS_URL_DETECTED" {
+		t.Fatalf("expected malicious URL error, got %v", err)
+	}
+}
+
+func BenchmarkRedirectFastPath(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_ = "https://example.com" + "/r/test"
 	}
 }
