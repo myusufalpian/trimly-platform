@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -13,12 +14,35 @@ type contextKey string
 
 const UserContextKey contextKey = "user"
 
-type Handler struct {
-	service *Service
+const sessionCookieName = "session_token"
+
+type authService interface {
+	Register(ctx context.Context, req RegisterRequest) (*User, error)
+	VerifyEmail(ctx context.Context, req VerifyEmailRequest) error
+	Login(ctx context.Context, req LoginRequest) (string, *User, error)
+	Logout(ctx context.Context, sessionToken string) error
+	GetUserFromSession(ctx context.Context, sessionToken string) (*User, error)
 }
 
-func NewHandler(service *Service) *Handler {
-	return &Handler{service: service}
+type Handler struct {
+	service      authService
+	cookieSecure bool
+}
+
+func NewHandler(service authService, cookieSecure bool) *Handler {
+	return &Handler{service: service, cookieSecure: cookieSecure}
+}
+
+func sessionCookie(token string, maxAge int, secure bool) *http.Cookie {
+	return &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	}
 }
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
@@ -31,7 +55,15 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 	user, err := h.service.Register(r.Context(), req)
 	if err != nil {
-		httputil.RespondError(w, http.StatusBadRequest, "REGISTRATION_FAILED", err.Error())
+		if errors.Is(err, ErrEmailTaken) {
+			httputil.RespondError(w, http.StatusConflict, "EMAIL_TAKEN", "an account with this email already exists")
+			return
+		}
+		if errors.Is(err, ErrInvalidInput) {
+			httputil.RespondError(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+			return
+		}
+		httputil.RespondError(w, http.StatusBadRequest, "REGISTRATION_FAILED", "unable to register, please try again")
 		return
 	}
 
@@ -51,7 +83,11 @@ func (h *Handler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 
 	err := h.service.VerifyEmail(r.Context(), req)
 	if err != nil {
-		httputil.RespondError(w, http.StatusBadRequest, "VERIFICATION_FAILED", err.Error())
+		if errors.Is(err, ErrInvalidInput) {
+			httputil.RespondError(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+			return
+		}
+		httputil.RespondError(w, http.StatusBadRequest, "VERIFICATION_FAILED", "invalid or expired verification token")
 		return
 	}
 
@@ -70,20 +106,18 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	token, user, err := h.service.Login(r.Context(), req)
 	if err != nil {
-		httputil.RespondError(w, http.StatusUnauthorized, "LOGIN_FAILED", err.Error())
+		if errors.Is(err, ErrInvalidInput) {
+			httputil.RespondError(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+			return
+		}
+		httputil.RespondError(w, http.StatusUnauthorized, "LOGIN_FAILED", "invalid email or password")
 		return
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session_token",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-	})
+	http.SetCookie(w, sessionCookie(token, 0, h.cookieSecure))
 
 	httputil.RespondJSON(w, http.StatusOK, map[string]interface{}{
-		"user":  user,
-		"token": token,
+		"user": user,
 	})
 }
 
@@ -91,12 +125,7 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	token := h.extractToken(r)
 	_ = h.service.Logout(r.Context(), token)
 
-	http.SetCookie(w, &http.Cookie{
-		Name:   "session_token",
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
-	})
+	http.SetCookie(w, sessionCookie("", -1, h.cookieSecure))
 
 	httputil.RespondJSON(w, http.StatusOK, map[string]string{
 		"message": "Logged out successfully",
@@ -145,7 +174,7 @@ func (h *Handler) RequireVerifiedEmailMiddleware(next http.Handler) http.Handler
 }
 
 func (h *Handler) extractToken(r *http.Request) string {
-	cookie, err := r.Cookie("session_token")
+	cookie, err := r.Cookie(sessionCookieName)
 	if err == nil && cookie.Value != "" {
 		return cookie.Value
 	}

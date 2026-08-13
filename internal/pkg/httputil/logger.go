@@ -5,8 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"net"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -23,16 +23,14 @@ func GenerateRequestID() string {
 	return hex.EncodeToString(bytes)
 }
 
-// GetClientIP extracts real client IP considering X-Forwarded-For & X-Real-IP headers
-func GetClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
+// GetRemoteIP returns the untrusted socket peer IP (RemoteAddr without port).
+// It must not reflect client-supplied headers, so it is safe to use as a rate-limit key.
+func GetRemoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
 	}
-	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-		return strings.TrimSpace(xrip)
-	}
-	return r.RemoteAddr
+	return host
 }
 
 // RequestLoggerMiddleware logs incoming HTTP requests using slog and injects X-Request-ID
@@ -68,7 +66,7 @@ func RequestLoggerMiddleware(next http.Handler) http.Handler {
 			slog.String("path", path),
 			slog.Int("status", rw.statusCode),
 			slog.Duration("duration", duration),
-			slog.String("ip", GetClientIP(r)),
+			slog.String("ip", GetRemoteIP(r)),
 		)
 	})
 }

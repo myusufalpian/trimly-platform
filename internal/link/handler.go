@@ -1,6 +1,7 @@
 package link
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,11 +11,19 @@ import (
 	"trimly-platform/internal/pkg/httputil"
 )
 
-type Handler struct {
-	service *Service
+type linkService interface {
+	CreateLink(ctx context.Context, user *auth.User, req CreateLinkRequest) (*Link, error)
+	ResolveAndRecordRedirect(ctx context.Context, slug, source string) (string, error)
+	GetAnalytics(ctx context.Context, user *auth.User, linkID string) (*AnalyticsSummary, error)
+	GenerateQRCode(ctx context.Context, user *auth.User, linkID, baseURL string) ([]byte, error)
+	ExportCSVAnalytics(ctx context.Context, user *auth.User, linkID string) ([]byte, error)
 }
 
-func NewHandler(service *Service) *Handler {
+type Handler struct {
+	service linkService
+}
+
+func NewHandler(service linkService) *Handler {
 	return &Handler{service: service}
 }
 
@@ -59,6 +68,10 @@ func (h *Handler) PublicRedirect(w http.ResponseWriter, r *http.Request) {
 
 	targetURL, err := h.service.ResolveAndRecordRedirect(r.Context(), slug, "DIRECT")
 	if err != nil {
+		if errors.Is(err, ErrMaliciousURL) {
+			httputil.RespondError(w, http.StatusBadRequest, "MALICIOUS_URL_DETECTED", "This link is blocked because it leads to a malicious or blacklisted domain")
+			return
+		}
 		httputil.RespondError(w, http.StatusNotFound, "LINK_NOT_FOUND", err.Error())
 		return
 	}
@@ -80,6 +93,14 @@ func (h *Handler) GetAnalytics(w http.ResponseWriter, r *http.Request) {
 
 	analytics, err := h.service.GetAnalytics(r.Context(), user, linkID)
 	if err != nil {
+		if errors.Is(err, ErrLinkNotFound) {
+			httputil.RespondError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+			return
+		}
+		if errors.Is(err, ErrLinkUnauthorized) {
+			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
+			return
+		}
 		httputil.RespondError(w, http.StatusBadRequest, "FETCH_ANALYTICS_FAILED", err.Error())
 		return
 	}

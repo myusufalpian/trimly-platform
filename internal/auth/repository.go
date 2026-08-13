@@ -8,8 +8,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const postgresUniqueViolation = "23505"
+
+var ErrEmailTaken = errors.New("email already registered")
 
 type Repository struct {
 	db *pgxpool.Pool
@@ -17,6 +22,11 @@ type Repository struct {
 
 func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
+}
+
+func isDuplicateKeyError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == postgresUniqueViolation
 }
 
 func HashToken(rawToken string) string {
@@ -41,6 +51,9 @@ func (r *Repository) CreateUserWithPlan(ctx context.Context, email, passwordHash
 		&user.ID, &user.Email, &user.PlanCode, &user.IsPlatformAdmin, &user.CreatedAt, &user.UpdatedAt,
 	)
 	if err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, ErrEmailTaken
+		}
 		return nil, err
 	}
 
