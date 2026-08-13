@@ -3,7 +3,6 @@ package security
 import (
 	"context"
 	"net/url"
-	"strings"
 )
 
 type MockURLScanner struct {
@@ -13,7 +12,7 @@ type MockURLScanner struct {
 func NewMockURLScanner(domains ...string) *MockURLScanner {
 	maliciousDomains := make(map[string]bool, len(domains))
 	for _, domain := range domains {
-		maliciousDomains[strings.ToLower(strings.TrimSpace(domain))] = true
+		maliciousDomains[NormalizeHostname(domain)] = true
 	}
 	return &MockURLScanner{MaliciousDomains: maliciousDomains}
 }
@@ -23,5 +22,5 @@ func (s *MockURLScanner) CheckURL(_ context.Context, targetURL string) (bool, er
 	if err != nil {
 		return false, err
 	}
-	return s.MaliciousDomains[strings.ToLower(parsed.Hostname())], nil
+	return IsHostInSet(parsed.Hostname(), s.MaliciousDomains), nil
 }

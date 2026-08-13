@@ -22,6 +22,18 @@ import (
 	"trimly-platform/internal/workspace"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/time/rate"
+)
+
+const (
+	loginRateLimit       rate.Limit = 1
+	loginRateBurst                  = 5
+	registerRateLimit    rate.Limit = 0.2
+	registerRateBurst               = 3
+	verifyEmailRateLimit rate.Limit = 1
+	verifyEmailRateBurst            = 10
+	logoutRateLimit      rate.Limit = 1
+	logoutRateBurst                 = 20
 )
 
 func main() {
@@ -31,7 +43,11 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	cfg := config.LoadConfig()
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		slog.Error("Configuration error", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -54,7 +70,7 @@ func main() {
 	// Auth Module
 	authRepo := auth.NewRepository(dbPool)
 	authService := auth.NewService(authRepo, mailAdapter)
-	authHandler := auth.NewHandler(authService)
+	authHandler := auth.NewHandler(authService, cfg.CookieSecure)
 
 	// Workspace Module
 	workspaceRepo := workspace.NewRepository(dbPool)
@@ -121,11 +137,23 @@ func main() {
 	// Public Redirect Route (Fast Path)
 	mux.HandleFunc("GET /r/", linkHandler.PublicRedirect)
 
-	// Auth Endpoints
-	mux.HandleFunc("POST /v1/auth/register", authHandler.Register)
-	mux.HandleFunc("POST /v1/auth/verify-email", authHandler.VerifyEmail)
-	mux.HandleFunc("POST /v1/auth/login", authHandler.Login)
-	mux.HandleFunc("POST /v1/auth/logout", authHandler.Logout)
+	// Auth Endpoints (rate-limited per client IP to mitigate brute-force)
+	proxyExtractor, err := httputil.NewTrustedProxyExtractor(cfg.TrustedProxies)
+	if err != nil {
+		slog.Error("Invalid TRUSTED_PROXIES configuration", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	loginLimiter := httputil.NewIPRateLimiter(loginRateLimit, loginRateBurst)
+	registerLimiter := httputil.NewIPRateLimiter(registerRateLimit, registerRateBurst)
+	verifyEmailLimiter := httputil.NewIPRateLimiter(verifyEmailRateLimit, verifyEmailRateBurst)
+	logoutLimiter := httputil.NewIPRateLimiter(logoutRateLimit, logoutRateBurst)
+	for _, l := range []*httputil.IPRateLimiter{loginLimiter, registerLimiter, verifyEmailLimiter, logoutLimiter} {
+		l.SetKeyFunc(proxyExtractor.ClientIP)
+	}
+	mux.Handle("POST /v1/auth/register", registerLimiter.Middleware(http.HandlerFunc(authHandler.Register)))
+	mux.Handle("POST /v1/auth/verify-email", verifyEmailLimiter.Middleware(http.HandlerFunc(authHandler.VerifyEmail)))
+	mux.Handle("POST /v1/auth/login", loginLimiter.Middleware(http.HandlerFunc(authHandler.Login)))
+	mux.Handle("POST /v1/auth/logout", logoutLimiter.Middleware(http.HandlerFunc(authHandler.Logout)))
 
 	// Middleware Chains
 	authChain := func(handler http.HandlerFunc) http.Handler {
@@ -179,16 +207,18 @@ func main() {
 	// B2B Integrator Link Creation Endpoint (Authenticated via API Key & Rate Limited 60/min + 5000/day)
 	mux.Handle("POST /v1/api/links", apiKeyChain(linkHandler.CreateLink))
 
-	// Wrap entire Mux with TASK-702 Request Logger Middleware
-	loggedHandler := httputil.RequestLoggerMiddleware(mux)
+	// Wrap entire Mux with security headers, request body limit, and TASK-702 Request Logger
+	securedHandler := httputil.SecurityHeaders(httputil.LimitRequestBody(mux))
+	loggedHandler := httputil.RequestLoggerMiddleware(securedHandler)
 
 	// HTTP Server Configuration
 	server := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      loggedHandler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + cfg.Port,
+		Handler:           loggedHandler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// TASK-703: Graceful Shutdown Setup

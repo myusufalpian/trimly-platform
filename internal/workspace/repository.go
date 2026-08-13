@@ -77,6 +77,8 @@ func (r *Repository) GetUserWorkspaces(ctx context.Context, userID string) ([]Wo
 	return workspaces, nil
 }
 
+var ErrMemberNotFound = errors.New("member not found in workspace")
+
 func (r *Repository) GetMemberRole(ctx context.Context, workspaceID, userID string) (Role, error) {
 	var role string
 	query := `
@@ -86,7 +88,7 @@ func (r *Repository) GetMemberRole(ctx context.Context, workspaceID, userID stri
 	err := r.db.QueryRow(ctx, query, workspaceID, userID).Scan(&role)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return "", errors.New("member not found in workspace")
+			return "", ErrMemberNotFound
 		}
 		return "", err
 	}
@@ -99,7 +101,7 @@ func (r *Repository) AddMemberByEmail(ctx context.Context, workspaceID, targetEm
 	err := r.db.QueryRow(ctx, userQuery, targetEmail).Scan(&targetUserID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return errors.New("user with this email does not exist")
+			return errors.New("unable to add member to workspace")
 		}
 		return err
 	}

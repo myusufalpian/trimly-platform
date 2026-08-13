@@ -1,18 +1,26 @@
 package workspace
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"trimly-platform/internal/auth"
 	"trimly-platform/internal/pkg/httputil"
 )
 
-type Handler struct {
-	service *Service
+type workspaceService interface {
+	CreateWorkspace(ctx context.Context, userID, name string) (*Workspace, error)
+	GetUserWorkspaces(ctx context.Context, userID string) ([]Workspace, error)
+	AddMember(ctx context.Context, workspaceID, callerID, email string, role Role) error
 }
 
-func NewHandler(service *Service) *Handler {
+type Handler struct {
+	service workspaceService
+}
+
+func NewHandler(service workspaceService) *Handler {
 	return &Handler{service: service}
 }
 
@@ -51,6 +59,11 @@ func (h *Handler) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
+	user, ok := r.Context().Value(auth.UserContextKey).(*auth.User)
+	if !ok || user == nil {
+		httputil.RespondError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
 	workspaceID := r.URL.Query().Get("workspace_id")
 	if workspaceID == "" {
 		httputil.RespondError(w, http.StatusBadRequest, "MISSING_PARAM", "workspace_id query parameter is required")
@@ -63,8 +76,12 @@ func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := h.service.AddMember(r.Context(), workspaceID, req.UserEmail, req.Role)
+	err := h.service.AddMember(r.Context(), workspaceID, user.ID, req.UserEmail, req.Role)
 	if err != nil {
+		if errors.Is(err, ErrInsufficientPermission) {
+			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", "insufficient workspace permissions")
+			return
+		}
 		httputil.RespondError(w, http.StatusBadRequest, "ADD_MEMBER_FAILED", err.Error())
 		return
 	}

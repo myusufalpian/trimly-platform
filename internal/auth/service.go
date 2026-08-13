@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	netmail "net/mail"
+	"strings"
 	"time"
 
 	"trimly-platform/internal/pkg/mail"
@@ -12,8 +14,18 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+type authRepository interface {
+	CreateUserWithPlan(ctx context.Context, email, passwordHash string) (*User, error)
+	SaveVerificationToken(ctx context.Context, userID, rawToken string, expiresAt time.Time) error
+	VerifyEmailToken(ctx context.Context, rawToken string) error
+	GetUserByEmail(ctx context.Context, email string) (*User, error)
+	CreateSession(ctx context.Context, userID, rawToken string, expiresAt time.Time) error
+	RevokeSession(ctx context.Context, rawToken string) error
+	GetSessionUser(ctx context.Context, rawToken string) (*User, error)
+}
+
 type Service struct {
-	repo       *Repository
+	repo       authRepository
 	mailSender mail.EmailSender
 	emailChan  chan emailTask
 }
@@ -23,7 +35,7 @@ type emailTask struct {
 	token string
 }
 
-func NewService(repo *Repository, mailSender mail.EmailSender) *Service {
+func NewService(repo authRepository, mailSender mail.EmailSender) *Service {
 	s := &Service{
 		repo:       repo,
 		mailSender: mailSender,
@@ -48,13 +60,45 @@ func generateRandomToken(bytesLen int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+var ErrInvalidInput = errors.New("invalid input")
+
+type inputError struct{ msg string }
+
+func (e *inputError) Error() string { return e.msg }
+
+func (e *inputError) Is(target error) bool { return target == ErrInvalidInput }
+
+func invalidInput(msg string) error { return &inputError{msg: msg} }
+
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func canonicalEmail(email string) (string, error) {
+	addr, err := netmail.ParseAddress(email)
+	if err != nil || addr.Address == "" {
+		return "", errors.New("invalid email format")
+	}
+	return addr.Address, nil
+}
+
 func (s *Service) Register(ctx context.Context, req RegisterRequest) (*User, error) {
-	if req.Email == "" || req.Password == "" {
-		return nil, errors.New("email and password are required")
+	normalized := normalizeEmail(req.Email)
+	if normalized == "" || req.Password == "" {
+		return nil, invalidInput("email and password are required")
+	}
+
+	email, err := canonicalEmail(normalized)
+	if err != nil {
+		return nil, invalidInput("invalid email format")
 	}
 
 	if len(req.Password) < 8 {
-		return nil, errors.New("password must be at least 8 characters long")
+		return nil, invalidInput("password must be at least 8 characters long")
+	}
+
+	if len(req.Password) > 72 {
+		return nil, invalidInput("password must not exceed 72 characters")
 	}
 
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
@@ -62,7 +106,7 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*User, err
 		return nil, err
 	}
 
-	user, err := s.repo.CreateUserWithPlan(ctx, req.Email, string(hashedPassword))
+	user, err := s.repo.CreateUserWithPlan(ctx, email, string(hashedPassword))
 	if err != nil {
 		return nil, err
 	}
@@ -85,17 +129,18 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*User, err
 
 func (s *Service) VerifyEmail(ctx context.Context, req VerifyEmailRequest) error {
 	if req.Token == "" {
-		return errors.New("verification token is required")
+		return invalidInput("verification token is required")
 	}
 	return s.repo.VerifyEmailToken(ctx, req.Token)
 }
 
 func (s *Service) Login(ctx context.Context, req LoginRequest) (string, *User, error) {
-	if req.Email == "" || req.Password == "" {
-		return "", nil, errors.New("email and password are required")
+	email := normalizeEmail(req.Email)
+	if email == "" || req.Password == "" {
+		return "", nil, invalidInput("email and password are required")
 	}
 
-	user, err := s.repo.GetUserByEmail(ctx, req.Email)
+	user, err := s.repo.GetUserByEmail(ctx, email)
 	if err != nil {
 		return "", nil, errors.New("invalid email or password")
 	}

@@ -9,11 +9,19 @@ import (
 	"trimly-platform/internal/pkg/httputil"
 )
 
-type Service struct {
-	repo *Repository
+type workspaceRepository interface {
+	CreateWorkspace(ctx context.Context, name, userID string) (*Workspace, error)
+	GetUserWorkspaces(ctx context.Context, userID string) ([]Workspace, error)
+	GetMemberRole(ctx context.Context, workspaceID, userID string) (Role, error)
+	AddMemberByEmail(ctx context.Context, workspaceID, targetEmail string, role Role) error
+	RemoveMemberOrLeave(ctx context.Context, workspaceID, targetUserID string) error
 }
 
-func NewService(repo *Repository) *Service {
+type Service struct {
+	repo workspaceRepository
+}
+
+func NewService(repo workspaceRepository) *Service {
 	return &Service{repo: repo}
 }
 
@@ -28,12 +36,15 @@ func (s *Service) GetUserWorkspaces(ctx context.Context, userID string) ([]Works
 	return s.repo.GetUserWorkspaces(ctx, userID)
 }
 
-func (s *Service) AddMember(ctx context.Context, workspaceID, email string, role Role) error {
+func (s *Service) AddMember(ctx context.Context, workspaceID, callerID, email string, role Role) error {
 	if email == "" {
 		return errors.New("email is required")
 	}
 	if role != RoleAdmin && role != RoleMember && role != RoleOwner {
 		role = RoleMember
+	}
+	if err := s.CheckPermission(ctx, workspaceID, callerID, RoleOwner, RoleAdmin); err != nil {
+		return err
 	}
 	return s.repo.AddMemberByEmail(ctx, workspaceID, email, role)
 }
@@ -42,9 +53,14 @@ func (s *Service) LeaveOrRemoveMember(ctx context.Context, workspaceID, userID s
 	return s.repo.RemoveMemberOrLeave(ctx, workspaceID, userID)
 }
 
+var ErrInsufficientPermission = errors.New("insufficient workspace permissions")
+
 func (s *Service) CheckPermission(ctx context.Context, workspaceID, userID string, requiredRoles ...Role) error {
 	userRole, err := s.repo.GetMemberRole(ctx, workspaceID, userID)
 	if err != nil {
+		if errors.Is(err, ErrMemberNotFound) {
+			return ErrInsufficientPermission
+		}
 		return err
 	}
 
@@ -54,7 +70,7 @@ func (s *Service) CheckPermission(ctx context.Context, workspaceID, userID strin
 		}
 	}
 
-	return errors.New("insufficient workspace permissions")
+	return ErrInsufficientPermission
 }
 
 // RBAC Middleware Helper

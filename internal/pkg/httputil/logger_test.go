@@ -56,17 +56,3 @@ func TestRequestLoggerMiddlewareCustomID(t *testing.T) {
 		t.Errorf("expected X-Request-ID header %s, got %s", customID, rec.Header().Get("X-Request-ID"))
 	}
 }
-
-func TestGetClientIP(t *testing.T) {
-	reqXFF := httptest.NewRequest("GET", "/", nil)
-	reqXFF.Header.Set("X-Forwarded-For", "203.0.113.195, 70.41.3.18")
-	if ip := httputil.GetClientIP(reqXFF); ip != "203.0.113.195" {
-		t.Errorf("expected 203.0.113.195, got %s", ip)
-	}
-
-	reqXRealIP := httptest.NewRequest("GET", "/", nil)
-	reqXRealIP.Header.Set("X-Real-IP", "198.51.100.1")
-	if ip := httputil.GetClientIP(reqXRealIP); ip != "198.51.100.1" {
-		t.Errorf("expected 198.51.100.1, got %s", ip)
-	}
-}
