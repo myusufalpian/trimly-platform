@@ -3,10 +3,106 @@ package auth
 import (
 	"errors"
 	"net/http"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+type countingMailSender struct {
+	mu     sync.Mutex
+	sent   int
+	sentCh chan struct{}
+}
+
+func newCountingMailSender() *countingMailSender {
+	return &countingMailSender{sentCh: make(chan struct{}, 10)}
+}
+
+func (m *countingMailSender) SendVerificationEmail(toEmail, token string) error {
+	m.mu.Lock()
+	m.sent++
+	m.mu.Unlock()
+
+	select {
+	case m.sentCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (m *countingMailSender) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sent
+}
+
+func TestStartEmailWorkerProcessesTask(t *testing.T) {
+	mailer := newCountingMailSender()
+	s := &Service{
+		repo:       nil,
+		mailSender: mailer,
+		emailChan:  make(chan emailTask, 1),
+		done:       make(chan struct{}),
+	}
+	s.wg.Add(1)
+	go s.startEmailWorker()
+
+	s.emailChan <- emailTask{email: "test@example.com", token: "tok-123"}
+
+	select {
+	case <-mailer.sentCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("email was not sent within deadline")
+	}
+
+	s.Shutdown()
+}
+
+func TestStartEmailWorkerDrainsOnShutdown(t *testing.T) {
+	mailer := newCountingMailSender()
+	s := &Service{
+		repo:       nil,
+		mailSender: mailer,
+		emailChan:  make(chan emailTask, 3),
+		done:       make(chan struct{}),
+	}
+	s.wg.Add(1)
+	go s.startEmailWorker()
+
+	s.emailChan <- emailTask{email: "a@test.com", token: "tok-1"}
+	s.emailChan <- emailTask{email: "b@test.com", token: "tok-2"}
+	s.emailChan <- emailTask{email: "c@test.com", token: "tok-3"}
+
+	s.Shutdown()
+
+	if mailer.count() != 3 {
+		t.Errorf("expected 3 emails sent, got %d", mailer.count())
+	}
+}
+
+func TestGenerateRandomToken(t *testing.T) {
+	token, err := generateRandomToken(16)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if token == "" {
+		t.Error("expected non-empty token")
+	}
+	expectedLen := 16 * 2
+	if len(token) != expectedLen {
+		t.Errorf("expected token length %d, got %d", expectedLen, len(token))
+	}
+
+	token2, err := generateRandomToken(16)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if token == token2 {
+		t.Error("expected different random tokens")
+	}
+}
 
 func TestNormalizeEmail(t *testing.T) {
 	tests := []struct {

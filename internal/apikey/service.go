@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,80 +16,100 @@ import (
 	"golang.org/x/time/rate"
 )
 
-type Service struct {
-	repo     *Repository
-	limiters map[string]*rate.Limiter
-	mu       sync.RWMutex
+const (
+	b2bRateLimitPerSec = 1.0
+	b2bRateBurst       = 60
+	b2bDailyQuota      = 5000
+	apiKeyPrefix       = "trimly_live_"
+	apiKeyPrefixLen    = 12
+	apiKeyRandBytes    = 16
+)
+
+var (
+	ErrBusinessPlanRequired = errors.New("API key generation is exclusive to Business plan")
+)
+
+type apiKeyRepository interface {
+	CreateAPIKey(ctx context.Context, userID, keyPrefix, rawKey string) (*APIKeyResponse, error)
+	GetUserAPIKeys(ctx context.Context, userID string) ([]APIKeyResponse, error)
+	RevokeAPIKey(ctx context.Context, keyID, userID string) error
+	ValidateAPIKey(ctx context.Context, rawKey string) (*auth.User, string, error)
+	IncrementAndCheckDailyQuota(ctx context.Context, apiKeyID string) error
+	GetAPIUsageHistory(ctx context.Context, userID string) ([]APIUsageDaily, error)
 }
 
-func NewService(repo *Repository) *Service {
+type Service struct {
+	repo     apiKeyRepository
+	limiters sync.Map
+}
+
+func NewService(repo apiKeyRepository) *Service {
 	return &Service{
-		repo:     repo,
-		limiters: make(map[string]*rate.Limiter),
+		repo: repo,
 	}
 }
 
 func (s *Service) getRateLimiter(apiKeyID string) *rate.Limiter {
-	s.mu.RLock()
-	limiter, exists := s.limiters[apiKeyID]
-	s.mu.RUnlock()
-
-	if exists {
-		return limiter
+	if v, ok := s.limiters.Load(apiKeyID); ok {
+		return v.(*rate.Limiter)
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Double check after lock
-	if limiter, exists = s.limiters[apiKeyID]; exists {
-		return limiter
-	}
-
-	// 60 requests per minute = 1 req/sec with a burst capability of 60 (FR-21 / AC-23)
-	limiter = rate.NewLimiter(rate.Limit(1.0), 60)
-	s.limiters[apiKeyID] = limiter
-	return limiter
+	limiter := rate.NewLimiter(rate.Limit(b2bRateLimitPerSec), b2bRateBurst)
+	actual, _ := s.limiters.LoadOrStore(apiKeyID, limiter)
+	return actual.(*rate.Limiter)
 }
 
 func generateAPIKeyString() (string, string, error) {
-	b := make([]byte, 16)
+	b := make([]byte, apiKeyRandBytes)
 	_, err := rand.Read(b)
 	if err != nil {
 		return "", "", err
 	}
 	randomPart := hex.EncodeToString(b)
-	rawKey := "trimly_live_" + randomPart
-	keyPrefix := rawKey[:12]
+	rawKey := apiKeyPrefix + randomPart
+	keyPrefix := rawKey[:apiKeyPrefixLen]
 	return rawKey, keyPrefix, nil
 }
 
 func (s *Service) CreateAPIKey(ctx context.Context, user *auth.User) (*APIKeyResponse, error) {
 	if user.PlanCode != "BUSINESS" {
-		return nil, errors.New("API key generation is exclusive to Business plan")
+		return nil, ErrBusinessPlanRequired
 	}
 
 	rawKey, keyPrefix, err := generateAPIKeyString()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create api key: generate: %w", err)
 	}
 
-	return s.repo.CreateAPIKey(ctx, user.ID, keyPrefix, rawKey)
+	resp, err := s.repo.CreateAPIKey(ctx, user.ID, keyPrefix, rawKey)
+	if err != nil {
+		return nil, fmt.Errorf("create api key: %w", err)
+	}
+	return resp, nil
 }
 
 func (s *Service) GetUserAPIKeys(ctx context.Context, userID string) ([]APIKeyResponse, error) {
-	return s.repo.GetUserAPIKeys(ctx, userID)
+	keys, err := s.repo.GetUserAPIKeys(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("get user api keys: %w", err)
+	}
+	return keys, nil
 }
 
 func (s *Service) RevokeAPIKey(ctx context.Context, keyID, userID string) error {
-	return s.repo.RevokeAPIKey(ctx, keyID, userID)
+	if err := s.repo.RevokeAPIKey(ctx, keyID, userID); err != nil {
+		return fmt.Errorf("revoke api key: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) GetAPIUsageHistory(ctx context.Context, userID string) ([]APIUsageDaily, error) {
-	return s.repo.GetAPIUsageHistory(ctx, userID)
+	history, err := s.repo.GetAPIUsageHistory(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("get api usage history: %w", err)
+	}
+	return history, nil
 }
 
-// B2B API Key Authentication & Rate Limiting Middleware
 func (s *Service) APIKeyAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rawKey := extractAPIKeyFromRequest(r)
@@ -99,21 +120,19 @@ func (s *Service) APIKeyAuthMiddleware(next http.Handler) http.Handler {
 
 		user, apiKeyID, err := s.repo.ValidateAPIKey(r.Context(), rawKey)
 		if err != nil {
-			httputil.RespondError(w, http.StatusUnauthorized, "INVALID_API_KEY", err.Error())
+			httputil.RespondError(w, http.StatusUnauthorized, "INVALID_API_KEY", "invalid or revoked API key")
 			return
 		}
 
-		// 1. Minute Rate Limiter (60 req/min in-memory check - AC-23)
 		limiter := s.getRateLimiter(apiKeyID)
 		if !limiter.Allow() {
-			httputil.RespondError(w, http.StatusTooManyRequests, "RATE_LIMIT_EXCEEDED", "Rate limit of 60 requests per minute exceeded")
+			httputil.RespondError(w, http.StatusTooManyRequests, "RATE_LIMIT_EXCEEDED", fmt.Sprintf("Rate limit of %d requests per minute exceeded", b2bRateBurst))
 			return
 		}
 
-		// 2. Transactional Daily Quota Check (5,000 req/day DB check - AC-24)
 		err = s.repo.IncrementAndCheckDailyQuota(r.Context(), apiKeyID)
 		if err != nil {
-			httputil.RespondError(w, http.StatusTooManyRequests, "DAILY_QUOTA_EXCEEDED", err.Error())
+			httputil.RespondError(w, http.StatusTooManyRequests, "DAILY_QUOTA_EXCEEDED", fmt.Sprintf("Daily API quota of %d requests exceeded", b2bDailyQuota))
 			return
 		}
 

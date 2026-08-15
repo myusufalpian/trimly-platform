@@ -36,7 +36,3 @@ type AddMemberRequest struct {
 	UserEmail string `json:"user_email"`
 	Role      Role   `json:"role"`
 }
-
-type UpdateMemberRoleRequest struct {
-	Role Role `json:"role"`
-}

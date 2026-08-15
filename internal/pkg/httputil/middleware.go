@@ -1,6 +1,9 @@
 package httputil
 
-import "net/http"
+import (
+	"net/http"
+	"strings"
+)
 
 const maxRequestBodyBytes = 1 << 20
 
@@ -21,4 +24,18 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func RequestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return "https"
+	}
+	return "http"
+}
+
+func BaseURL(r *http.Request) string {
+	return RequestScheme(r) + "://" + r.Host
 }

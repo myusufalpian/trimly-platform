@@ -56,13 +56,20 @@ func TestRequireVerifiedEmailMiddleware(t *testing.T) {
 			user:           &auth.User{ID: "user-2", Email: "verified@example.com", EmailVerifiedAt: &now},
 			expectedStatus: http.StatusOK,
 		},
+		{
+			name:           "Nil User Blocked",
+			user:           nil,
+			expectedStatus: http.StatusUnauthorized,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("POST", "/v1/links", nil)
-			ctx := context.WithValue(req.Context(), auth.UserContextKey, tt.user)
-			req = req.WithContext(ctx)
+			if tt.user != nil {
+				ctx := context.WithValue(req.Context(), auth.UserContextKey, tt.user)
+				req = req.WithContext(ctx)
+			}
 
 			rr := httptest.NewRecorder()
 			nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +100,54 @@ func TestAuthMiddlewareTokenExtraction(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 Unauthorized for missing token, got %d", rr.Code)
+	}
+}
+
+func TestAuthMiddlewareValidSession(t *testing.T) {
+	mailer := &stubMailSender{}
+	repo := &stubAuthRepo{}
+	svc := auth.NewService(repo, mailer)
+	handler := auth.NewHandler(svc, true)
+	middleware := handler.AuthMiddleware
+
+	req := httptest.NewRequest("GET", "/v1/auth/me", nil)
+	req.AddCookie(&http.Cookie{Name: "session_token", Value: "valid-token"})
+	rr := httptest.NewRecorder()
+
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value(auth.UserContextKey).(*auth.User)
+		if user.ID != "user-1" {
+			t.Errorf("expected user-1, got %s", user.ID)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	middleware(nextHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 OK, got %d", rr.Code)
+	}
+}
+
+func TestAuthMiddlewareInvalidSession(t *testing.T) {
+	mailer := &stubMailSender{}
+	repo := &stubAuthRepo{}
+	svc := auth.NewService(repo, mailer)
+	handler := auth.NewHandler(svc, true)
+	middleware := handler.AuthMiddleware
+
+	req := httptest.NewRequest("GET", "/v1/auth/me", nil)
+	req.AddCookie(&http.Cookie{Name: "session_token", Value: "invalid-token"})
+	rr := httptest.NewRecorder()
+
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	middleware(nextHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized, got %d", rr.Code)
 	}
 }
 

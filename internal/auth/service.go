@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	netmail "net/mail"
 	"strings"
+	"sync"
 	"time"
 
 	"trimly-platform/internal/pkg/mail"
@@ -28,6 +30,8 @@ type Service struct {
 	repo       authRepository
 	mailSender mail.EmailSender
 	emailChan  chan emailTask
+	done       chan struct{}
+	wg         sync.WaitGroup
 }
 
 type emailTask struct {
@@ -35,20 +39,48 @@ type emailTask struct {
 	token string
 }
 
+const (
+	emailChanBufferSize = 100
+	verificationExpiry  = 24 * time.Hour
+	sessionExpiry       = 7 * 24 * time.Hour
+	tokenBytesLen       = 16
+	sessionTokenBytes   = 32
+)
+
 func NewService(repo authRepository, mailSender mail.EmailSender) *Service {
 	s := &Service{
 		repo:       repo,
 		mailSender: mailSender,
-		emailChan:  make(chan emailTask, 100),
+		emailChan:  make(chan emailTask, emailChanBufferSize),
+		done:       make(chan struct{}),
 	}
+	s.wg.Add(1)
 	go s.startEmailWorker()
 	return s
 }
 
 func (s *Service) startEmailWorker() {
-	for task := range s.emailChan {
-		_ = s.mailSender.SendVerificationEmail(task.email, task.token)
+	defer s.wg.Done()
+	for {
+		select {
+		case task, ok := <-s.emailChan:
+			if !ok {
+				return
+			}
+			_ = s.mailSender.SendVerificationEmail(task.email, task.token)
+		case <-s.done:
+			for task := range s.emailChan {
+				_ = s.mailSender.SendVerificationEmail(task.email, task.token)
+			}
+			return
+		}
 	}
+}
+
+func (s *Service) Shutdown() {
+	close(s.done)
+	close(s.emailChan)
+	s.wg.Wait()
 }
 
 func generateRandomToken(bytesLen int) (string, error) {
@@ -103,24 +135,22 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*User, err
 
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("register: hash password: %w", err)
 	}
 
 	user, err := s.repo.CreateUserWithPlan(ctx, email, string(hashedPassword))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("register: create user: %w", err)
 	}
 
-	rawToken, err := generateRandomToken(16)
+	rawToken, err := generateRandomToken(tokenBytesLen)
 	if err == nil {
-		expiresAt := time.Now().Add(24 * time.Hour)
+		expiresAt := time.Now().Add(verificationExpiry)
 		_ = s.repo.SaveVerificationToken(ctx, user.ID, rawToken, expiresAt)
 
-		// Dispatch async verification email (Non-blocking)
 		select {
 		case s.emailChan <- emailTask{email: user.Email, token: rawToken}:
 		default:
-			// Buffer full, fallback log/drop
 		}
 	}
 
@@ -131,7 +161,10 @@ func (s *Service) VerifyEmail(ctx context.Context, req VerifyEmailRequest) error
 	if req.Token == "" {
 		return invalidInput("verification token is required")
 	}
-	return s.repo.VerifyEmailToken(ctx, req.Token)
+	if err := s.repo.VerifyEmailToken(ctx, req.Token); err != nil {
+		return fmt.Errorf("verify email: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) Login(ctx context.Context, req LoginRequest) (string, *User, error) {
@@ -150,15 +183,15 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (string, *User, e
 		return "", nil, errors.New("invalid email or password")
 	}
 
-	sessionToken, err := generateRandomToken(32)
+	sessionToken, err := generateRandomToken(sessionTokenBytes)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("login: generate token: %w", err)
 	}
 
-	expiresAt := time.Now().Add(7 * 24 * time.Hour)
+	expiresAt := time.Now().Add(sessionExpiry)
 	err = s.repo.CreateSession(ctx, user.ID, sessionToken, expiresAt)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("login: create session: %w", err)
 	}
 
 	return sessionToken, user, nil
@@ -168,12 +201,19 @@ func (s *Service) Logout(ctx context.Context, sessionToken string) error {
 	if sessionToken == "" {
 		return nil
 	}
-	return s.repo.RevokeSession(ctx, sessionToken)
+	if err := s.repo.RevokeSession(ctx, sessionToken); err != nil {
+		return fmt.Errorf("logout: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) GetUserFromSession(ctx context.Context, sessionToken string) (*User, error) {
 	if sessionToken == "" {
 		return nil, errors.New("unauthenticated")
 	}
-	return s.repo.GetSessionUser(ctx, sessionToken)
+	user, err := s.repo.GetSessionUser(ctx, sessionToken)
+	if err != nil {
+		return nil, fmt.Errorf("get session user: %w", err)
+	}
+	return user, nil
 }

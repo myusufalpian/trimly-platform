@@ -41,40 +41,46 @@ func TestCreateLinkValidations(t *testing.T) {
 	futureTime := time.Now().Add(24 * time.Hour)
 
 	tests := []struct {
-		name          string
-		user          *auth.User
-		req           link.CreateLinkRequest
-		expectedError string
+		name           string
+		user           *auth.User
+		req            link.CreateLinkRequest
+		expectedError  string
+		isInvalidInput bool
 	}{
 		{
-			name:          "Empty Target URL",
-			user:          userFree,
-			req:           link.CreateLinkRequest{TargetURL: ""},
-			expectedError: "target_url is required",
+			name:           "Empty Target URL",
+			user:           userFree,
+			req:            link.CreateLinkRequest{TargetURL: ""},
+			expectedError:  "target_url is required",
+			isInvalidInput: true,
 		},
 		{
-			name:          "Invalid Target URL Format",
-			user:          userFree,
-			req:           link.CreateLinkRequest{TargetURL: "invalid-url-string"},
-			expectedError: "invalid target_url format",
+			name:           "Invalid Target URL Format",
+			user:           userFree,
+			req:            link.CreateLinkRequest{TargetURL: "invalid-url-string"},
+			expectedError:  "invalid target_url format",
+			isInvalidInput: true,
 		},
 		{
-			name:          "Blacklisted Domain Target URL",
-			user:          userFree,
-			req:           link.CreateLinkRequest{TargetURL: "https://malicious.com/phishing"},
-			expectedError: "target_url domain is blacklisted and cannot be shortened",
+			name:           "Blacklisted Domain Target URL",
+			user:           userFree,
+			req:            link.CreateLinkRequest{TargetURL: "https://malicious.com/phishing"},
+			expectedError:  "target_url domain is blacklisted and cannot be shortened",
+			isInvalidInput: true,
 		},
 		{
-			name:          "Custom Alias Prohibited for Free Plan",
-			user:          userFree,
-			req:           link.CreateLinkRequest{TargetURL: "https://example.com", CustomAlias: "my-custom-slug"},
-			expectedError: "custom alias is only available on Pro or Business plans",
+			name:           "Custom Alias Prohibited for Free Plan",
+			user:           userFree,
+			req:            link.CreateLinkRequest{TargetURL: "https://example.com", CustomAlias: "my-custom-slug"},
+			expectedError:  "custom alias is only available on Pro or Business plans",
+			isInvalidInput: true,
 		},
 		{
-			name:          "Expiry Time Prohibited for Free Plan",
-			user:          userFree,
-			req:           link.CreateLinkRequest{TargetURL: "https://example.com", ExpiresAt: &futureTime},
-			expectedError: "expiry time is only available on Pro or Business plans",
+			name:           "Expiry Time Prohibited for Free Plan",
+			user:           userFree,
+			req:            link.CreateLinkRequest{TargetURL: "https://example.com", ExpiresAt: &futureTime},
+			expectedError:  "expiry time is only available on Pro or Business plans",
+			isInvalidInput: true,
 		},
 	}
 
@@ -84,8 +90,11 @@ func TestCreateLinkValidations(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tt.expectedError)
 			}
-			if err.Error() != tt.expectedError {
-				t.Errorf("expected error %q, got %q", tt.expectedError, err.Error())
+			if tt.isInvalidInput && !errors.Is(err, link.ErrInvalidInput) {
+				t.Errorf("expected ErrInvalidInput, got %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.expectedError) {
+				t.Errorf("expected error containing %q, got %q", tt.expectedError, err.Error())
 			}
 		})
 	}
@@ -173,7 +182,7 @@ func (s *stubLinkRepo) GetLinkByID(ctx context.Context, linkID string) (*link.Li
 	return s.linkByID, s.linkByIDErr
 }
 
-func (s *stubLinkRepo) GetExportAnalytics(ctx context.Context, linkID string) ([]link.ClickExportRow, error) {
+func (s *stubLinkRepo) GetExportAnalytics(ctx context.Context, linkID string, limit int) ([]link.ClickExportRow, error) {
 	return s.exportRows, nil
 }
 
@@ -222,8 +231,8 @@ func TestCreateLinkRejectsNonHTTPScheme(t *testing.T) {
 	svc := link.NewService(nil, nil)
 
 	_, err := svc.CreateLink(context.Background(), &auth.User{ID: "user-1", PlanCode: "FREE"}, link.CreateLinkRequest{TargetURL: "javascript:alert(1)"})
-	if err == nil || err.Error() != "invalid target_url scheme" {
-		t.Fatalf("expected scheme error, got %v", err)
+	if !errors.Is(err, link.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
 	}
 }
 
@@ -234,16 +243,16 @@ func TestCreateLinkBlacklistSuffix(t *testing.T) {
 	t.Run("Trailing dot bypass is blocked", func(t *testing.T) {
 		svc := link.NewService(nil, checker)
 		_, err := svc.CreateLink(context.Background(), user, link.CreateLinkRequest{TargetURL: "http://phishing.com./login"})
-		if err == nil || err.Error() != "target_url domain is blacklisted and cannot be shortened" {
-			t.Fatalf("expected blacklisted error, got %v", err)
+		if !errors.Is(err, link.ErrInvalidInput) {
+			t.Fatalf("expected ErrInvalidInput, got %v", err)
 		}
 	})
 
 	t.Run("Subdomain of blacklisted domain is blocked", func(t *testing.T) {
 		svc := link.NewService(nil, checker)
 		_, err := svc.CreateLink(context.Background(), user, link.CreateLinkRequest{TargetURL: "http://evil.phishing.com/login"})
-		if err == nil || err.Error() != "target_url domain is blacklisted and cannot be shortened" {
-			t.Fatalf("expected blacklisted error, got %v", err)
+		if !errors.Is(err, link.ErrInvalidInput) {
+			t.Fatalf("expected ErrInvalidInput, got %v", err)
 		}
 	})
 
@@ -338,10 +347,16 @@ type stubLinkService struct {
 	analyticsErr   error
 	redirectTarget string
 	redirectErr    error
+	created        *link.Link
+	createErr      error
+	exportBytes    []byte
+	exportErr      error
+	qrBytes        []byte
+	qrErr          error
 }
 
 func (s *stubLinkService) CreateLink(ctx context.Context, user *auth.User, req link.CreateLinkRequest) (*link.Link, error) {
-	return nil, nil
+	return s.created, s.createErr
 }
 
 func (s *stubLinkService) ResolveAndRecordRedirect(ctx context.Context, slug, source string) (string, error) {
@@ -353,11 +368,14 @@ func (s *stubLinkService) GetAnalytics(ctx context.Context, user *auth.User, lin
 }
 
 func (s *stubLinkService) GenerateQRCode(ctx context.Context, user *auth.User, linkID, baseURL string) ([]byte, error) {
-	return nil, nil
+	if s.qrBytes != nil {
+		return s.qrBytes, s.qrErr
+	}
+	return []byte("fake-png"), s.qrErr
 }
 
 func (s *stubLinkService) ExportCSVAnalytics(ctx context.Context, user *auth.User, linkID string) ([]byte, error) {
-	return nil, nil
+	return s.exportBytes, s.exportErr
 }
 
 func authContextRequest(method, path string) *http.Request {
@@ -440,8 +458,8 @@ func TestGetAnalyticsHandlerGenericError(t *testing.T) {
 
 	handler.GetAnalytics(rr, authContextRequest("GET", "/v1/links/analytics?link_id=link-1"))
 
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 Bad Request for generic error, got %d", rr.Code)
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 Internal Server Error for generic error, got %d", rr.Code)
 	}
 }
 
@@ -454,4 +472,401 @@ func TestPublicRedirectBlocksMaliciousTarget(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 Bad Request for malicious target, got %d", rr.Code)
 	}
+}
+
+func TestPublicRedirectSuccess(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{redirectTarget: "https://example.com"})
+	rr := httptest.NewRecorder()
+
+	handler.PublicRedirect(rr, httptest.NewRequest("GET", "/r/abc123", nil))
+
+	if rr.Code != http.StatusFound {
+		t.Errorf("expected 302 Found, got %d", rr.Code)
+	}
+	if rr.Header().Get("Location") != "https://example.com" {
+		t.Errorf("expected Location header 'https://example.com', got %s", rr.Header().Get("Location"))
+	}
+}
+
+func TestCreateLinkHandlerSuccess(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{created: &link.Link{ID: "link-1"}})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/links", strings.NewReader(`{"target_url":"https://example.com"}`))
+	ctx := context.WithValue(req.Context(), auth.UserContextKey, &auth.User{ID: "user-1", PlanCode: "FREE"})
+	req = req.WithContext(ctx)
+
+	handler.CreateLink(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201, got %d", rr.Code)
+	}
+}
+
+func TestCreateLinkHandlerMaliciousURL(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{createErr: link.ErrMaliciousURL})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/links", strings.NewReader(`{"target_url":"https://evil.com"}`))
+	ctx := context.WithValue(req.Context(), auth.UserContextKey, &auth.User{ID: "user-1", PlanCode: "FREE"})
+	req = req.WithContext(ctx)
+
+	handler.CreateLink(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestCreateLinkHandlerForbidden(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{createErr: link.ErrCustomDomainPlan})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/links", strings.NewReader(`{"target_url":"https://example.com","custom_domain":"my.domain.com"}`))
+	ctx := context.WithValue(req.Context(), auth.UserContextKey, &auth.User{ID: "user-1", PlanCode: "FREE"})
+	req = req.WithContext(ctx)
+
+	handler.CreateLink(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", rr.Code)
+	}
+}
+
+func TestCreateLinkHandlerWorkspaceForbidden(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{createErr: link.ErrWorkspaceForbidden})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/links", strings.NewReader(`{"target_url":"https://example.com"}`))
+	ctx := context.WithValue(req.Context(), auth.UserContextKey, &auth.User{ID: "user-1", PlanCode: "FREE"})
+	req = req.WithContext(ctx)
+
+	handler.CreateLink(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", rr.Code)
+	}
+}
+
+func TestCreateLinkHandlerInvalidInput(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{createErr: link.ErrInvalidInput})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/links", strings.NewReader(`{"target_url":""}`))
+	ctx := context.WithValue(req.Context(), auth.UserContextKey, &auth.User{ID: "user-1", PlanCode: "FREE"})
+	req = req.WithContext(ctx)
+
+	handler.CreateLink(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestCreateLinkHandlerGenericError(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{createErr: errors.New("db error")})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/links", strings.NewReader(`{"target_url":"https://example.com"}`))
+	ctx := context.WithValue(req.Context(), auth.UserContextKey, &auth.User{ID: "user-1", PlanCode: "FREE"})
+	req = req.WithContext(ctx)
+
+	handler.CreateLink(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", rr.Code)
+	}
+}
+
+func TestCreateLinkHandlerUnauthenticated(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{})
+	rr := httptest.NewRecorder()
+	handler.CreateLink(rr, httptest.NewRequest("POST", "/v1/links", strings.NewReader(`{"target_url":"https://example.com"}`)))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestPublicRedirectEmptySlug(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{redirectErr: errors.New("not found")})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/r/abc", nil)
+	handler.PublicRedirect(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestPublicRedirectNotFound(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{redirectErr: errors.New("not found")})
+	rr := httptest.NewRecorder()
+	handler.PublicRedirect(rr, httptest.NewRequest("GET", "/r/missing", nil))
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestGenerateQRCodeHandlerUnauthenticated(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{})
+	rr := httptest.NewRecorder()
+	handler.GenerateQRCode(rr, httptest.NewRequest("GET", "/v1/links/qr?link_id=link-1", nil))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestGenerateQRCodeHandlerMissingLinkID(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{})
+	rr := httptest.NewRecorder()
+	handler.GenerateQRCode(rr, authContextRequest("GET", "/v1/links/qr"))
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestGenerateQRCodeHandlerSuccess(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{})
+	rr := httptest.NewRecorder()
+	handler.GenerateQRCode(rr, authContextRequest("GET", "/v1/links/qr?link_id=link-1"))
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+	if rr.Header().Get("Content-Type") != "image/png" {
+		t.Errorf("expected Content-Type image/png, got %s", rr.Header().Get("Content-Type"))
+	}
+}
+
+func TestGenerateQRCodeHandlerNotFound(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{qrErr: link.ErrLinkNotFound})
+	rr := httptest.NewRecorder()
+	handler.GenerateQRCode(rr, authContextRequest("GET", "/v1/links/qr?link_id=notfound"))
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestGenerateQRCodeHandlerUnauthorized(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{qrErr: link.ErrLinkUnauthorized})
+	rr := httptest.NewRecorder()
+	handler.GenerateQRCode(rr, authContextRequest("GET", "/v1/links/qr?link_id=link-1"))
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", rr.Code)
+	}
+}
+
+func TestGenerateQRCodeHandlerGenericError(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{qrErr: errors.New("database error")})
+	rr := httptest.NewRecorder()
+	handler.GenerateQRCode(rr, authContextRequest("GET", "/v1/links/qr?link_id=link-1"))
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", rr.Code)
+	}
+}
+
+func TestExportCSVHandlerUnauthenticated(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{})
+	rr := httptest.NewRecorder()
+	handler.ExportCSVAnalytics(rr, httptest.NewRequest("GET", "/v1/analytics/export?link_id=link-1", nil))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestExportCSVHandlerMissingLinkID(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{})
+	rr := httptest.NewRecorder()
+	handler.ExportCSVAnalytics(rr, authContextRequest("GET", "/v1/analytics/export"))
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestExportCSVHandlerForbidden(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{exportErr: link.ErrCSVPlan})
+	rr := httptest.NewRecorder()
+	handler.ExportCSVAnalytics(rr, authContextRequest("GET", "/v1/analytics/export?link_id=link-1"))
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", rr.Code)
+	}
+}
+
+func TestExportCSVHandlerGenericError(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{exportErr: errors.New("db error")})
+	rr := httptest.NewRecorder()
+	handler.ExportCSVAnalytics(rr, authContextRequest("GET", "/v1/analytics/export?link_id=link-1"))
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", rr.Code)
+	}
+}
+
+func TestExportCSVHandlerSuccess(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{exportBytes: []byte("timestamp,slug\n2024-01-01,abc123")})
+	rr := httptest.NewRecorder()
+	handler.ExportCSVAnalytics(rr, authContextRequest("GET", "/v1/analytics/export?link_id=link-1"))
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+	if rr.Header().Get("Content-Type") != "text/csv" {
+		t.Errorf("expected Content-Type text/csv, got %s", rr.Header().Get("Content-Type"))
+	}
+}
+
+func TestExportCSVHandlerNotFound(t *testing.T) {
+	handler := link.NewHandler(&stubLinkService{exportErr: link.ErrLinkNotFound})
+	rr := httptest.NewRecorder()
+	handler.ExportCSVAnalytics(rr, authContextRequest("GET", "/v1/analytics/export?link_id=notfound"))
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+type mockWorkspaceChecker struct {
+	members map[string]map[string]bool
+}
+
+func (m *mockWorkspaceChecker) IsMember(ctx context.Context, workspaceID, userID string) bool {
+	if m.members == nil {
+		return false
+	}
+	if workspaceUsers, ok := m.members[workspaceID]; ok {
+		return workspaceUsers[userID]
+	}
+	return false
+}
+
+func TestCreateLinkWithWorkspaceValidation(t *testing.T) {
+	checker := &mockWorkspaceChecker{
+		members: map[string]map[string]bool{
+			"ws-1": {"user-1": true},
+		},
+	}
+
+	t.Run("nil workspace ID allowed", func(t *testing.T) {
+		repo := &stubLinkRepo{slugAvailable: true, created: &link.Link{ID: "link-1"}}
+		svc := link.NewService(repo, nil)
+		svc.SetWorkspaceChecker(checker)
+
+		user := &auth.User{ID: "user-1", PlanCode: "FREE"}
+		_, err := svc.CreateLink(context.Background(), user, link.CreateLinkRequest{
+			TargetURL:   "https://example.com",
+			WorkspaceID: nil,
+		})
+		if err != nil {
+			t.Errorf("expected no error for nil workspace, got %v", err)
+		}
+	})
+
+	t.Run("empty workspace ID allowed", func(t *testing.T) {
+		repo := &stubLinkRepo{slugAvailable: true, created: &link.Link{ID: "link-1"}}
+		svc := link.NewService(repo, nil)
+		svc.SetWorkspaceChecker(checker)
+
+		user := &auth.User{ID: "user-1", PlanCode: "FREE"}
+		emptyWs := ""
+		_, err := svc.CreateLink(context.Background(), user, link.CreateLinkRequest{
+			TargetURL:   "https://example.com",
+			WorkspaceID: &emptyWs,
+		})
+		if err != nil {
+			t.Errorf("expected no error for empty workspace, got %v", err)
+		}
+	})
+
+	t.Run("member can create link in workspace", func(t *testing.T) {
+		repo := &stubLinkRepo{slugAvailable: true, created: &link.Link{ID: "link-1"}}
+		svc := link.NewService(repo, nil)
+		svc.SetWorkspaceChecker(checker)
+
+		user := &auth.User{ID: "user-1", PlanCode: "FREE"}
+		wsID := "ws-1"
+		_, err := svc.CreateLink(context.Background(), user, link.CreateLinkRequest{
+			TargetURL:   "https://example.com",
+			WorkspaceID: &wsID,
+		})
+		if err != nil {
+			t.Errorf("expected no error for workspace member, got %v", err)
+		}
+	})
+
+	t.Run("non-member cannot create link in workspace", func(t *testing.T) {
+		repo := &stubLinkRepo{slugAvailable: true, created: &link.Link{ID: "link-1"}}
+		svc := link.NewService(repo, nil)
+		svc.SetWorkspaceChecker(checker)
+
+		user := &auth.User{ID: "user-2", PlanCode: "FREE"}
+		wsID := "ws-1"
+		_, err := svc.CreateLink(context.Background(), user, link.CreateLinkRequest{
+			TargetURL:   "https://example.com",
+			WorkspaceID: &wsID,
+		})
+		if !errors.Is(err, link.ErrWorkspaceForbidden) {
+			t.Errorf("expected ErrWorkspaceForbidden, got %v", err)
+		}
+	})
+
+	t.Run("no checker set allows any workspace", func(t *testing.T) {
+		repo := &stubLinkRepo{slugAvailable: true, created: &link.Link{ID: "link-1"}}
+		svc := link.NewService(repo, nil)
+
+		user := &auth.User{ID: "user-1", PlanCode: "FREE"}
+		wsID := "ws-1"
+		_, err := svc.CreateLink(context.Background(), user, link.CreateLinkRequest{
+			TargetURL:   "https://example.com",
+			WorkspaceID: &wsID,
+		})
+		if err != nil {
+			t.Errorf("expected no error without checker, got %v", err)
+		}
+	})
+}
+
+func TestGenerateQRCode(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		repo := &stubLinkRepo{
+			linkByID: &link.Link{ID: "link-1", OwnerUserID: "user-1", Slug: "abc123"},
+		}
+		svc := link.NewService(repo, nil)
+		user := &auth.User{ID: "user-1"}
+
+		pngBytes, err := svc.GenerateQRCode(context.Background(), user, "link-1", "https://example.com")
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if len(pngBytes) == 0 {
+			t.Error("expected PNG bytes, got empty")
+		}
+	})
+
+	t.Run("link not found", func(t *testing.T) {
+		repo := &stubLinkRepo{linkByIDErr: link.ErrLinkNotFound}
+		svc := link.NewService(repo, nil)
+		user := &auth.User{ID: "user-1"}
+
+		_, err := svc.GenerateQRCode(context.Background(), user, "notfound", "https://example.com")
+		if !errors.Is(err, link.ErrLinkNotFound) {
+			t.Errorf("expected ErrLinkNotFound, got %v", err)
+		}
+	})
+
+	t.Run("unauthorized", func(t *testing.T) {
+		repo := &stubLinkRepo{
+			linkByID: &link.Link{ID: "link-1", OwnerUserID: "user-1", Slug: "abc123"},
+		}
+		svc := link.NewService(repo, nil)
+		user := &auth.User{ID: "user-2"}
+
+		_, err := svc.GenerateQRCode(context.Background(), user, "link-1", "https://example.com")
+		if !errors.Is(err, link.ErrLinkUnauthorized) {
+			t.Errorf("expected ErrLinkUnauthorized, got %v", err)
+		}
+	})
 }

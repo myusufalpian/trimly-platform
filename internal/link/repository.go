@@ -6,14 +6,21 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-type Repository struct {
-	db *pgxpool.Pool
+type DBTX interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-func NewRepository(db *pgxpool.Pool) *Repository {
+type Repository struct {
+	db DBTX
+}
+
+func NewRepository(db DBTX) *Repository {
 	return &Repository{db: db}
 }
 
@@ -22,7 +29,7 @@ func (r *Repository) CreateLinkAtomic(ctx context.Context, ownerUserID string, w
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var activeCount int
 	var planCode string
@@ -214,7 +221,7 @@ type ClickExportRow struct {
 	Device    string
 }
 
-func (r *Repository) GetExportAnalytics(ctx context.Context, linkID string) ([]ClickExportRow, error) {
+func (r *Repository) GetExportAnalytics(ctx context.Context, linkID string, limit int) ([]ClickExportRow, error) {
 	query := `
 		SELECT 
 			ce.clicked_at::text as timestamp,
@@ -227,8 +234,9 @@ func (r *Repository) GetExportAnalytics(ctx context.Context, linkID string) ([]C
 		JOIN links l ON ce.link_id = l.id
 		WHERE ce.link_id = $1
 		ORDER BY ce.clicked_at DESC
+		LIMIT $2
 	`
-	rows, err := r.db.Query(ctx, query, linkID)
+	rows, err := r.db.Query(ctx, query, linkID, limit)
 	if err != nil {
 		return nil, err
 	}

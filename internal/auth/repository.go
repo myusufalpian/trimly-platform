@@ -5,22 +5,29 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const postgresUniqueViolation = "23505"
 
 var ErrEmailTaken = errors.New("email already registered")
 
-type Repository struct {
-	db *pgxpool.Pool
+type DBTX interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-func NewRepository(db *pgxpool.Pool) *Repository {
+type Repository struct {
+	db DBTX
+}
+
+func NewRepository(db DBTX) *Repository {
 	return &Repository{db: db}
 }
 
@@ -39,7 +46,7 @@ func (r *Repository) CreateUserWithPlan(ctx context.Context, email, passwordHash
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	user := &User{}
 	userQuery := `
@@ -54,7 +61,7 @@ func (r *Repository) CreateUserWithPlan(ctx context.Context, email, passwordHash
 		if isDuplicateKeyError(err) {
 			return nil, ErrEmailTaken
 		}
-		return nil, err
+		return nil, fmt.Errorf("create user: %w", err)
 	}
 
 	planQuery := `
@@ -63,11 +70,11 @@ func (r *Repository) CreateUserWithPlan(ctx context.Context, email, passwordHash
 	`
 	_, err = tx.Exec(ctx, planQuery, user.ID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create plan usage: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("commit create user: %w", err)
 	}
 
 	return user, nil
@@ -89,7 +96,7 @@ func (r *Repository) VerifyEmailToken(ctx context.Context, rawToken string) erro
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var userID string
 	var expiresAt time.Time
