@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"trimly-platform/internal/auth"
@@ -27,7 +28,7 @@ func NewService(repo workspaceRepository) *Service {
 
 func (s *Service) CreateWorkspace(ctx context.Context, userID, name string) (*Workspace, error) {
 	if name == "" {
-		return nil, errors.New("workspace name is required")
+		return nil, fmt.Errorf("%w: workspace name is required", ErrInvalidInput)
 	}
 	return s.repo.CreateWorkspace(ctx, name, userID)
 }
@@ -38,7 +39,7 @@ func (s *Service) GetUserWorkspaces(ctx context.Context, userID string) ([]Works
 
 func (s *Service) AddMember(ctx context.Context, workspaceID, callerID, email string, role Role) error {
 	if email == "" {
-		return errors.New("email is required")
+		return fmt.Errorf("%w: email is required", ErrInvalidInput)
 	}
 	if role != RoleAdmin && role != RoleMember && role != RoleOwner {
 		role = RoleMember
@@ -54,6 +55,8 @@ func (s *Service) LeaveOrRemoveMember(ctx context.Context, workspaceID, userID s
 }
 
 var ErrInsufficientPermission = errors.New("insufficient workspace permissions")
+
+var ErrInvalidInput = errors.New("invalid input")
 
 func (s *Service) CheckPermission(ctx context.Context, workspaceID, userID string, requiredRoles ...Role) error {
 	userRole, err := s.repo.GetMemberRole(ctx, workspaceID, userID)

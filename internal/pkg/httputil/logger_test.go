@@ -56,3 +56,30 @@ func TestRequestLoggerMiddlewareCustomID(t *testing.T) {
 		t.Errorf("expected X-Request-ID header %s, got %s", customID, rec.Header().Get("X-Request-ID"))
 	}
 }
+
+func TestGenerateRequestID(t *testing.T) {
+	id := httputil.GenerateRequestID()
+	if id == "" {
+		t.Error("expected non-empty request ID")
+	}
+	if len(id) != 32 {
+		t.Errorf("expected request ID length 32, got %d", len(id))
+	}
+}
+
+func TestRequestLoggerMiddlewareSkipsHealthPath(t *testing.T) {
+	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	wrapped := httputil.RequestLoggerMiddleware(testHandler)
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	wrapped.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+}

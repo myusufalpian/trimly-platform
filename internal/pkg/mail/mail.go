@@ -15,6 +15,9 @@ type MailHogAdapter struct {
 	smtpPort string
 }
 
+// sendMail is an injectable function variable to allow stubbing in tests.
+var sendMail = smtp.SendMail
+
 func NewMailHogAdapter(host, port string) *MailHogAdapter {
 	return &MailHogAdapter{
 		smtpHost: host,
@@ -31,7 +34,7 @@ func (m *MailHogAdapter) SendVerificationEmail(toEmail, token string) error {
 	addr := fmt.Sprintf("%s:%s", m.smtpHost, m.smtpPort)
 
 	// MailHog does not require authentication
-	err := smtp.SendMail(addr, nil, from, []string{toEmail}, []byte(msg))
+	err := sendMail(addr, nil, from, []string{toEmail}, []byte(msg))
 	if err != nil {
 		log.Printf("[MailHogAdapter] Error sending verification email to %s: %v", toEmail, err)
 		return err

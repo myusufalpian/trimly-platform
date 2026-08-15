@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 
 	"trimly-platform/internal/auth"
 	"trimly-platform/internal/pkg/httputil"
@@ -47,11 +46,15 @@ func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 			httputil.RespondError(w, http.StatusBadRequest, "MALICIOUS_URL_DETECTED", "The provided target URL poses a security threat and cannot be shortened.")
 			return
 		}
-		if errors.Is(err, ErrCustomDomainPlan) {
+		if errors.Is(err, ErrCustomDomainPlan) || errors.Is(err, ErrWorkspaceForbidden) {
 			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
 			return
 		}
-		httputil.RespondError(w, http.StatusBadRequest, "CREATE_LINK_FAILED", err.Error())
+		if errors.Is(err, ErrInvalidInput) {
+			httputil.RespondError(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+			return
+		}
+		httputil.RespondError(w, http.StatusInternalServerError, "CREATE_LINK_FAILED", "unable to create shortlink")
 		return
 	}
 
@@ -59,8 +62,10 @@ func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) PublicRedirect(w http.ResponseWriter, r *http.Request) {
-	slug := strings.TrimPrefix(r.URL.Path, "/r/")
-	slug = strings.TrimSpace(slug)
+	slug := r.PathValue("slug")
+	if slug == "" {
+		slug = trimRedirectSlug(r.URL.Path)
+	}
 	if slug == "" {
 		httputil.RespondError(w, http.StatusBadRequest, "INVALID_SLUG", "Shortlink slug is required")
 		return
@@ -72,11 +77,25 @@ func (h *Handler) PublicRedirect(w http.ResponseWriter, r *http.Request) {
 			httputil.RespondError(w, http.StatusBadRequest, "MALICIOUS_URL_DETECTED", "This link is blocked because it leads to a malicious or blacklisted domain")
 			return
 		}
-		httputil.RespondError(w, http.StatusNotFound, "LINK_NOT_FOUND", err.Error())
+		httputil.RespondError(w, http.StatusNotFound, "LINK_NOT_FOUND", "shortlink not found")
 		return
 	}
 
 	http.Redirect(w, r, targetURL, http.StatusFound)
+}
+
+func trimRedirectSlug(path string) string {
+	s := path
+	if len(s) > 3 && s[:3] == "/r/" {
+		s = s[3:]
+	}
+	for len(s) > 0 && s[0] == ' ' {
+		s = s[1:]
+	}
+	for len(s) > 0 && s[len(s)-1] == ' ' {
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 func (h *Handler) GetAnalytics(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +120,7 @@ func (h *Handler) GetAnalytics(w http.ResponseWriter, r *http.Request) {
 			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
 			return
 		}
-		httputil.RespondError(w, http.StatusBadRequest, "FETCH_ANALYTICS_FAILED", err.Error())
+		httputil.RespondError(w, http.StatusInternalServerError, "FETCH_ANALYTICS_FAILED", "unable to fetch analytics")
 		return
 	}
 
@@ -120,13 +139,7 @@ func (h *Handler) GenerateQRCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		scheme = "https"
-	}
-	baseURL := scheme + "://" + r.Host
-
-	pngBytes, err := h.service.GenerateQRCode(r.Context(), user, linkID, baseURL)
+	pngBytes, err := h.service.GenerateQRCode(r.Context(), user, linkID, httputil.BaseURL(r))
 	if err != nil {
 		if errors.Is(err, ErrLinkNotFound) {
 			httputil.RespondError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
@@ -136,7 +149,7 @@ func (h *Handler) GenerateQRCode(w http.ResponseWriter, r *http.Request) {
 			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
 			return
 		}
-		httputil.RespondError(w, http.StatusBadRequest, "QR_GENERATE_FAILED", err.Error())
+		httputil.RespondError(w, http.StatusInternalServerError, "QR_GENERATE_FAILED", "unable to generate QR code")
 		return
 	}
 
@@ -167,7 +180,7 @@ func (h *Handler) ExportCSVAnalytics(w http.ResponseWriter, r *http.Request) {
 			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", err.Error())
 			return
 		}
-		httputil.RespondError(w, http.StatusBadRequest, "EXPORT_FAILED", err.Error())
+		httputil.RespondError(w, http.StatusInternalServerError, "EXPORT_FAILED", "unable to export analytics")
 		return
 	}
 

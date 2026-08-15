@@ -26,18 +26,37 @@ import (
 )
 
 const (
-	loginRateLimit       rate.Limit = 1
-	loginRateBurst                  = 5
-	registerRateLimit    rate.Limit = 0.2
-	registerRateBurst               = 3
-	verifyEmailRateLimit rate.Limit = 1
-	verifyEmailRateBurst            = 10
-	logoutRateLimit      rate.Limit = 1
-	logoutRateBurst                 = 20
+	loginRateLimit          rate.Limit = 1
+	loginRateBurst                     = 5
+	registerRateLimit       rate.Limit = 0.2
+	registerRateBurst                  = 3
+	verifyEmailRateLimit    rate.Limit = 1
+	verifyEmailRateBurst               = 10
+	logoutRateLimit         rate.Limit = 1
+	logoutRateBurst                    = 20
+	createAPIKeyRateLimit   rate.Limit = 0.5
+	createAPIKeyRateBurst              = 3
+	workspaceRateLimit      rate.Limit = 1
+	workspaceRateBurst                 = 5
+	serverReadHeaderTimeout            = 5 * time.Second
+	serverReadTimeout                  = 15 * time.Second
+	serverWriteTimeout                 = 15 * time.Second
+	serverIdleTimeout                  = 60 * time.Second
+	dbPingTimeout                      = 10 * time.Second
+	readinessPingTimeout               = 2 * time.Second
+	shutdownTimeout                    = 10 * time.Second
 )
 
+type workspaceMembershipAdapter struct {
+	repo workspace.Repository
+}
+
+func (w *workspaceMembershipAdapter) IsMember(ctx context.Context, workspaceID, userID string) bool {
+	role, err := w.repo.GetMemberRole(ctx, workspaceID, userID)
+	return err == nil && role != ""
+}
+
 func main() {
-	// Initialize Structured Logger (log/slog JSON Handler)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -49,7 +68,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), dbPingTimeout)
 	defer cancel()
 
 	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
@@ -64,44 +83,36 @@ func main() {
 		slog.Info("Successfully connected to PostgreSQL database")
 	}
 
-	// Adapters
 	mailAdapter := mail.NewMailHogAdapter(cfg.SMTPHost, cfg.SMTPPort)
 
-	// Auth Module
 	authRepo := auth.NewRepository(dbPool)
 	authService := auth.NewService(authRepo, mailAdapter)
 	authHandler := auth.NewHandler(authService, cfg.CookieSecure)
 
-	// Workspace Module
 	workspaceRepo := workspace.NewRepository(dbPool)
 	workspaceService := workspace.NewService(workspaceRepo)
 	workspaceHandler := workspace.NewHandler(workspaceService)
 
-	// Admin Module
 	adminRepo := admin.NewRepository(dbPool)
 	adminService := admin.NewService(adminRepo)
 	adminHandler := admin.NewHandler(adminService)
 
-	// API Key Module (Rilis 2 B2B)
 	apiKeyRepo := apikey.NewRepository(dbPool)
 	apiKeyService := apikey.NewService(apiKeyRepo)
 	apiKeyHandler := apikey.NewHandler(apiKeyService)
 
-	// Link Module (Injected with AdminService as DomainBlacklistChecker)
 	linkRepo := link.NewRepository(dbPool)
 	linkService := link.NewService(linkRepo, adminService)
 	linkService.SetURLScanner(security.NewMockURLScanner(cfg.ThreatDomains...))
+	linkService.SetWorkspaceChecker(&workspaceMembershipAdapter{repo: *workspaceRepo})
 	linkHandler := link.NewHandler(linkService)
 
-	// Link-in-Bio Module
 	bioRepo := bio.NewRepository(dbPool)
 	bioService := bio.NewService(bioRepo)
 	bioHandler := bio.NewHandler(bioService)
 
-	// Router
 	mux := http.NewServeMux()
 
-	// TASK-701: Health Check (Liveness Probe)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		httputil.RespondJSON(w, http.StatusOK, map[string]string{
 			"status":  "ok",
@@ -109,7 +120,6 @@ func main() {
 		})
 	})
 
-	// Legacy /health compatibility
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		httputil.RespondJSON(w, http.StatusOK, map[string]string{
 			"status":  "ok",
@@ -117,9 +127,8 @@ func main() {
 		})
 	})
 
-	// TASK-701: Readiness Probe (Checks Database Connection Ping)
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		pingCtx, pingCancel := context.WithTimeout(r.Context(), 2*time.Second)
+		pingCtx, pingCancel := context.WithTimeout(r.Context(), readinessPingTimeout)
 		defer pingCancel()
 
 		if err := dbPool.Ping(pingCtx); err != nil {
@@ -134,10 +143,8 @@ func main() {
 		})
 	})
 
-	// Public Redirect Route (Fast Path)
-	mux.HandleFunc("GET /r/", linkHandler.PublicRedirect)
+	mux.HandleFunc("GET /r/{slug}", linkHandler.PublicRedirect)
 
-	// Auth Endpoints (rate-limited per client IP to mitigate brute-force)
 	proxyExtractor, err := httputil.NewTrustedProxyExtractor(cfg.TrustedProxies)
 	if err != nil {
 		slog.Error("Invalid TRUSTED_PROXIES configuration", slog.String("error", err.Error()))
@@ -147,7 +154,9 @@ func main() {
 	registerLimiter := httputil.NewIPRateLimiter(registerRateLimit, registerRateBurst)
 	verifyEmailLimiter := httputil.NewIPRateLimiter(verifyEmailRateLimit, verifyEmailRateBurst)
 	logoutLimiter := httputil.NewIPRateLimiter(logoutRateLimit, logoutRateBurst)
-	for _, l := range []*httputil.IPRateLimiter{loginLimiter, registerLimiter, verifyEmailLimiter, logoutLimiter} {
+	createAPIKeyLimiter := httputil.NewIPRateLimiter(createAPIKeyRateLimit, createAPIKeyRateBurst)
+	workspaceLimiter := httputil.NewIPRateLimiter(workspaceRateLimit, workspaceRateBurst)
+	for _, l := range []*httputil.IPRateLimiter{loginLimiter, registerLimiter, verifyEmailLimiter, logoutLimiter, createAPIKeyLimiter, workspaceLimiter} {
 		l.SetKeyFunc(proxyExtractor.ClientIP)
 	}
 	mux.Handle("POST /v1/auth/register", registerLimiter.Middleware(http.HandlerFunc(authHandler.Register)))
@@ -155,7 +164,6 @@ func main() {
 	mux.Handle("POST /v1/auth/login", loginLimiter.Middleware(http.HandlerFunc(authHandler.Login)))
 	mux.Handle("POST /v1/auth/logout", logoutLimiter.Middleware(http.HandlerFunc(authHandler.Logout)))
 
-	// Middleware Chains
 	authChain := func(handler http.HandlerFunc) http.Handler {
 		return authHandler.AuthMiddleware(http.HandlerFunc(handler))
 	}
@@ -172,13 +180,11 @@ func main() {
 		return apiKeyService.APIKeyAuthMiddleware(http.HandlerFunc(handler))
 	}
 
-	// User Profile
 	mux.Handle("GET /v1/auth/me", authChain(func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value(auth.UserContextKey).(*auth.User)
 		httputil.RespondJSON(w, http.StatusOK, user)
 	}))
 
-	// Link Protected Endpoints (Web Session)
 	mux.Handle("POST /v1/links", verifiedAuthChain(linkHandler.CreateLink))
 	mux.Handle("POST /v1/bio-pages", authChain(bioHandler.CreatePage))
 	mux.Handle("POST /v1/bio-pages/{id}/links", authChain(bioHandler.AddLink))
@@ -187,41 +193,34 @@ func main() {
 	mux.Handle("GET /v1/links/qr", authChain(linkHandler.GenerateQRCode))
 	mux.Handle("GET /v1/analytics/export", authChain(linkHandler.ExportCSVAnalytics))
 
-	// Workspace Protected Endpoints
-	mux.Handle("POST /v1/workspaces", authChain(workspaceHandler.CreateWorkspace))
+	mux.Handle("POST /v1/workspaces", workspaceLimiter.Middleware(authChain(workspaceHandler.CreateWorkspace)))
 	mux.Handle("GET /v1/workspaces", authChain(workspaceHandler.ListWorkspaces))
 	mux.Handle("POST /v1/workspaces/members", authChain(workspaceHandler.AddMember))
 
-	// Minimal Platform Admin Endpoints
 	mux.Handle("GET /v1/admin/users", adminChain(adminHandler.ListUsers))
 	mux.Handle("POST /v1/admin/blacklist-domains", adminChain(adminHandler.AddBlacklistDomain))
 	mux.Handle("DELETE /v1/admin/blacklist-domains/", adminChain(adminHandler.RemoveBlacklistDomain))
 	mux.Handle("POST /v1/admin/clicks/unflag", adminChain(adminHandler.UnflagClick))
 
-	// Rilis 2: B2B API Key Management & B2B Link Creation
-	mux.Handle("POST /v1/api-keys", authChain(apiKeyHandler.CreateAPIKey))
+	mux.Handle("POST /v1/api-keys", createAPIKeyLimiter.Middleware(authChain(apiKeyHandler.CreateAPIKey)))
 	mux.Handle("GET /v1/api-keys", authChain(apiKeyHandler.ListAPIKeys))
 	mux.Handle("DELETE /v1/api-keys/", authChain(apiKeyHandler.RevokeAPIKey))
 	mux.Handle("GET /v1/api-usage", authChain(apiKeyHandler.GetUsageHistory))
 
-	// B2B Integrator Link Creation Endpoint (Authenticated via API Key & Rate Limited 60/min + 5000/day)
 	mux.Handle("POST /v1/api/links", apiKeyChain(linkHandler.CreateLink))
 
-	// Wrap entire Mux with security headers, request body limit, and TASK-702 Request Logger
 	securedHandler := httputil.SecurityHeaders(httputil.LimitRequestBody(mux))
 	loggedHandler := httputil.RequestLoggerMiddleware(securedHandler)
 
-	// HTTP Server Configuration
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           loggedHandler,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
 	}
 
-	// TASK-703: Graceful Shutdown Setup
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 
@@ -233,11 +232,10 @@ func main() {
 		}
 	}()
 
-	// Wait for termination signal
 	sig := <-stopChan
 	slog.Info("Received shutdown signal", slog.String("signal", sig.String()))
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
@@ -246,7 +244,7 @@ func main() {
 		slog.Info("HTTP server gracefully stopped")
 	}
 
-	// Close Database Pool cleanly
+	authService.Shutdown()
 	dbPool.Close()
 	slog.Info("Database pool connection closed cleanly")
 }

@@ -10,14 +10,21 @@ import (
 	"trimly-platform/internal/auth"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-type Repository struct {
-	db *pgxpool.Pool
+type DBTX interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-func NewRepository(db *pgxpool.Pool) *Repository {
+type Repository struct {
+	db DBTX
+}
+
+func NewRepository(db DBTX) *Repository {
 	return &Repository{db: db}
 }
 
@@ -107,7 +114,7 @@ func (r *Repository) IncrementAndCheckDailyQuota(ctx context.Context, apiKeyID s
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var currentCount int
 	query := `

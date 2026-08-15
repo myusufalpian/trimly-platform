@@ -2,6 +2,7 @@ package admin_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -59,7 +60,7 @@ func TestAddBlacklistDomainValidation(t *testing.T) {
 		t.Fatalf("expected error for empty domain, got nil")
 	}
 
-	if err.Error() != "domain is required" {
-		t.Errorf("expected error 'domain is required', got %q", err.Error())
+	if !errors.Is(err, admin.ErrDomainRequired) {
+		t.Errorf("expected ErrDomainRequired, got %v", err)
 	}
 }

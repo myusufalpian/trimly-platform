@@ -7,7 +7,8 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"errors"
-	"log"
+	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -18,8 +19,21 @@ import (
 	"github.com/skip2/go-qrcode"
 )
 
+const (
+	freeActiveLinkLimit = 10
+	randomSlugLength    = 7
+	clickChanBufferSize = 5000
+	clickWorkerTimeout  = 5 * time.Second
+	qrCodeSize          = 256
+	csvExportLimit      = 10000
+)
+
 type DomainBlacklistChecker interface {
 	IsDomainBlacklisted(ctx context.Context, domain string) bool
+}
+
+type WorkspaceMembershipChecker interface {
+	IsMember(ctx context.Context, workspaceID, userID string) bool
 }
 
 type linkRepository interface {
@@ -30,15 +44,17 @@ type linkRepository interface {
 	GetUserActiveLinkCount(ctx context.Context, userID string) (int, error)
 	IsSlugAvailable(ctx context.Context, slug string) bool
 	GetLinkByID(ctx context.Context, linkID string) (*Link, error)
-	GetExportAnalytics(ctx context.Context, linkID string) ([]ClickExportRow, error)
+	GetExportAnalytics(ctx context.Context, linkID string, limit int) ([]ClickExportRow, error)
 }
 
 var (
-	ErrMaliciousURL     = errors.New("MALICIOUS_URL_DETECTED")
-	ErrCustomDomainPlan = errors.New("custom domain is only available on Business plans")
-	ErrLinkNotFound     = errors.New("shortlink not found")
-	ErrLinkUnauthorized = errors.New("unauthorized access to shortlink")
-	ErrCSVPlan          = errors.New("CSV analytics export is only available on Pro or Business plans")
+	ErrMaliciousURL       = errors.New("MALICIOUS_URL_DETECTED")
+	ErrCustomDomainPlan   = errors.New("custom domain is only available on Business plans")
+	ErrLinkNotFound       = errors.New("shortlink not found")
+	ErrLinkUnauthorized   = errors.New("unauthorized access to shortlink")
+	ErrCSVPlan            = errors.New("CSV analytics export is only available on Pro or Business plans")
+	ErrInvalidInput       = errors.New("invalid input")
+	ErrWorkspaceForbidden = errors.New("you are not a member of this workspace")
 )
 
 var csvFormulaPrefixes = []string{"=", "+", "-", "@", "\t", "\r"}
@@ -81,6 +97,7 @@ type clickTask struct {
 type Service struct {
 	repo             linkRepository
 	blacklistChecker DomainBlacklistChecker
+	workspaceChecker WorkspaceMembershipChecker
 	scanner          security.URLScanner
 	clickChan        chan clickTask
 }
@@ -89,7 +106,7 @@ func NewService(repo linkRepository, blacklistChecker DomainBlacklistChecker) *S
 	s := &Service{
 		repo:             repo,
 		blacklistChecker: blacklistChecker,
-		clickChan:        make(chan clickTask, 5000),
+		clickChan:        make(chan clickTask, clickChanBufferSize),
 	}
 	go s.startClickWorker()
 	return s
@@ -97,12 +114,16 @@ func NewService(repo linkRepository, blacklistChecker DomainBlacklistChecker) *S
 
 func (s *Service) SetURLScanner(scanner security.URLScanner) { s.scanner = scanner }
 
+func (s *Service) SetWorkspaceChecker(checker WorkspaceMembershipChecker) {
+	s.workspaceChecker = checker
+}
+
 func (s *Service) startClickWorker() {
 	for task := range s.clickChan {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), clickWorkerTimeout)
 		err := s.repo.RecordClickEvent(ctx, task.linkID, task.source)
 		if err != nil {
-			log.Printf("[ClickWorker] Error recording click for link %s: %v", task.linkID, err)
+			slog.Error("ClickWorker: failed to record click", slog.String("link_id", task.linkID), slog.String("error", err.Error()))
 		}
 		cancel()
 	}
@@ -114,20 +135,21 @@ func generateRandomSlug(length int) string {
 	return hex.EncodeToString(b)[:length]
 }
 
-func (s *Service) CreateLink(ctx context.Context, user *auth.User, req CreateLinkRequest) (*Link, error) {
-	if req.TargetURL == "" {
-		return nil, errors.New("target_url is required")
+func (s *Service) validateTargetURL(ctx context.Context, targetURL string) (*url.URL, error) {
+	if targetURL == "" {
+		return nil, fmt.Errorf("%w: target_url is required", ErrInvalidInput)
 	}
 
-	parsedURL, err := url.ParseRequestURI(req.TargetURL)
+	parsedURL, err := url.ParseRequestURI(targetURL)
 	if err != nil {
-		return nil, errors.New("invalid target_url format")
+		return nil, fmt.Errorf("%w: invalid target_url format", ErrInvalidInput)
 	}
 	if !isAllowedTargetScheme(parsedURL.Scheme) {
-		return nil, errors.New("invalid target_url scheme")
+		return nil, fmt.Errorf("%w: invalid target_url scheme", ErrInvalidInput)
 	}
+
 	if s.scanner != nil {
-		malicious, scanErr := s.scanner.CheckURL(ctx, req.TargetURL)
+		malicious, scanErr := s.scanner.CheckURL(ctx, targetURL)
 		if scanErr != nil {
 			return nil, errors.New("unable to scan target_url")
 		}
@@ -135,28 +157,67 @@ func (s *Service) CreateLink(ctx context.Context, user *auth.User, req CreateLin
 			return nil, ErrMaliciousURL
 		}
 	}
-	if req.CustomDomain != "" && user.PlanCode != "BUSINESS" {
-		return nil, ErrCustomDomainPlan
-	}
 
 	if s.blacklistChecker != nil && isHostBlacklisted(ctx, s.blacklistChecker, parsedURL.Hostname()) {
-		return nil, errors.New("target_url domain is blacklisted and cannot be shortened")
+		return nil, fmt.Errorf("%w: target_url domain is blacklisted and cannot be shortened", ErrInvalidInput)
 	}
 
-	slug := strings.TrimSpace(req.CustomAlias)
+	return parsedURL, nil
+}
+
+func (s *Service) resolveSlug(ctx context.Context, user *auth.User, customAlias string) (string, error) {
+	slug := strings.TrimSpace(customAlias)
 	if slug != "" {
 		if user.PlanCode == "FREE" {
-			return nil, errors.New("custom alias is only available on Pro or Business plans")
+			return "", fmt.Errorf("%w: custom alias is only available on Pro or Business plans", ErrInvalidInput)
 		}
 		if !s.repo.IsSlugAvailable(ctx, slug) {
-			return nil, errors.New("custom alias is already taken")
+			return "", fmt.Errorf("%w: custom alias is already taken", ErrInvalidInput)
 		}
-	} else {
-		slug = generateRandomSlug(7)
+		return slug, nil
+	}
+	return generateRandomSlug(randomSlugLength), nil
+}
+
+func (s *Service) validatePlanFeatures(user *auth.User, req CreateLinkRequest) error {
+	if req.CustomDomain != "" && user.PlanCode != "BUSINESS" {
+		return ErrCustomDomainPlan
+	}
+	if req.ExpiresAt != nil && user.PlanCode == "FREE" {
+		return fmt.Errorf("%w: expiry time is only available on Pro or Business plans", ErrInvalidInput)
+	}
+	return nil
+}
+
+func (s *Service) validateWorkspace(ctx context.Context, user *auth.User, workspaceID *string) error {
+	if workspaceID == nil || *workspaceID == "" {
+		return nil
+	}
+	if s.workspaceChecker == nil {
+		return nil
+	}
+	if !s.workspaceChecker.IsMember(ctx, *workspaceID, user.ID) {
+		return ErrWorkspaceForbidden
+	}
+	return nil
+}
+
+func (s *Service) CreateLink(ctx context.Context, user *auth.User, req CreateLinkRequest) (*Link, error) {
+	if _, err := s.validateTargetURL(ctx, req.TargetURL); err != nil {
+		return nil, err
 	}
 
-	if req.ExpiresAt != nil && user.PlanCode == "FREE" {
-		return nil, errors.New("expiry time is only available on Pro or Business plans")
+	if err := s.validatePlanFeatures(user, req); err != nil {
+		return nil, err
+	}
+
+	if err := s.validateWorkspace(ctx, user, req.WorkspaceID); err != nil {
+		return nil, err
+	}
+
+	slug, err := s.resolveSlug(ctx, user, req.CustomAlias)
+	if err != nil {
+		return nil, err
 	}
 
 	return s.repo.CreateLinkAtomic(ctx, user.ID, req.WorkspaceID, slug, req.TargetURL, req.CustomDomain, user.PlanCode, req.ExpiresAt, req.UTM)
@@ -175,7 +236,7 @@ func (s *Service) ResolveAndRecordRedirect(ctx context.Context, slug, source str
 	select {
 	case s.clickChan <- clickTask{linkID: link.ID, source: source}:
 	default:
-		log.Printf("[Service] Click buffer full, dropping click event for link %s", link.ID)
+		slog.Warn("Click buffer full, dropping click event", slog.String("link_id", link.ID))
 	}
 
 	return link.TargetURL, nil
@@ -203,8 +264,6 @@ func (s *Service) isTargetBlocked(ctx context.Context, targetURL string) bool {
 	if !isAllowedTargetScheme(parsed.Scheme) {
 		return true
 	}
-	// ponytail: exact-host re-check at redirect keeps the fast path to a single DB lookup;
-	// switch to suffix-based isHostBlacklisted if redirector abuse via subdomain trickery appears.
 	return s.blacklistChecker.IsDomainBlacklisted(ctx, security.NormalizeHostname(parsed.Hostname()))
 }
 
@@ -212,10 +271,10 @@ func (s *Service) CheckDowngradeAllowed(ctx context.Context, userID, newPlan str
 	if newPlan == "FREE" {
 		activeCount, err := s.repo.GetUserActiveLinkCount(ctx, userID)
 		if err != nil {
-			return err
+			return fmt.Errorf("check downgrade: %w", err)
 		}
-		if activeCount > 10 {
-			return errors.New("cannot downgrade to Free: you have more than 10 active links. Please delete excess links first")
+		if activeCount > freeActiveLinkLimit {
+			return fmt.Errorf("cannot downgrade to Free: you have more than %d active links. Please delete excess links first", freeActiveLinkLimit)
 		}
 	}
 	return nil
@@ -232,7 +291,7 @@ func (s *Service) GenerateQRCode(ctx context.Context, user *auth.User, linkID, b
 	}
 
 	targetURL := strings.TrimRight(baseURL, "/") + "/r/" + link.Slug
-	pngBytes, err := qrcode.Encode(targetURL, qrcode.Medium, 256)
+	pngBytes, err := qrcode.Encode(targetURL, qrcode.Medium, qrCodeSize)
 	if err != nil {
 		return nil, errors.New("failed to generate QR code PNG")
 	}
@@ -254,15 +313,14 @@ func (s *Service) ExportCSVAnalytics(ctx context.Context, user *auth.User, linkI
 		return nil, ErrLinkUnauthorized
 	}
 
-	rows, err := s.repo.GetExportAnalytics(ctx, linkID)
+	rows, err := s.repo.GetExportAnalytics(ctx, linkID, csvExportLimit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("export csv: %w", err)
 	}
 
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
 
-	// Write CSV Header
 	_ = writer.Write([]string{"timestamp", "slug", "country", "referrer", "user_agent", "device"})
 
 	for _, r := range rows {
@@ -278,7 +336,7 @@ func (s *Service) ExportCSVAnalytics(ctx context.Context, user *auth.User, linkI
 
 	writer.Flush()
 	if err := writer.Error(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("export csv flush: %w", err)
 	}
 
 	return buf.Bytes(), nil

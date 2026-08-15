@@ -1,6 +1,7 @@
 package bio
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,9 +11,15 @@ import (
 	"trimly-platform/internal/pkg/httputil"
 )
 
-type Handler struct{ service *Service }
+type bioService interface {
+	CreatePage(ctx context.Context, user *auth.User, req CreatePageRequest) (*Page, error)
+	AddLink(ctx context.Context, user *auth.User, pageID string, req AddLinkRequest) error
+	GetPublicPage(ctx context.Context, slug, baseURL string) (*PublicPage, error)
+}
 
-func NewHandler(service *Service) *Handler { return &Handler{service: service} }
+type Handler struct{ service bioService }
+
+func NewHandler(service bioService) *Handler { return &Handler{service: service} }
 
 func (h *Handler) CreatePage(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
@@ -32,6 +39,9 @@ func (h *Handler) CreatePage(w http.ResponseWriter, r *http.Request) {
 		code := "CREATE_BIO_PAGE_FAILED"
 		if errors.Is(err, ErrFreePageLimit) {
 			status, code = http.StatusForbidden, "FORBIDDEN"
+		}
+		if errors.Is(err, ErrInvalidInput) {
+			status, code = http.StatusBadRequest, "INVALID_INPUT"
 		}
 		httputil.RespondError(w, status, code, err.Error())
 		return
@@ -73,11 +83,7 @@ func (h *Handler) PublicPage(w http.ResponseWriter, r *http.Request) {
 		httputil.RespondError(w, http.StatusBadRequest, "INVALID_SLUG", "Bio page slug is required")
 		return
 	}
-	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		scheme = "https"
-	}
-	page, err := h.service.GetPublicPage(r.Context(), slug, scheme+"://"+r.Host)
+	page, err := h.service.GetPublicPage(r.Context(), slug, httputil.BaseURL(r))
 	if err != nil {
 		httputil.RespondError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
 		return

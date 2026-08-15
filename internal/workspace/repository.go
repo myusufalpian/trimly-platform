@@ -6,14 +6,21 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-type Repository struct {
-	db *pgxpool.Pool
+type DBTX interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-func NewRepository(db *pgxpool.Pool) *Repository {
+type Repository struct {
+	db DBTX
+}
+
+func NewRepository(db DBTX) *Repository {
 	return &Repository{db: db}
 }
 
@@ -22,7 +29,7 @@ func (r *Repository) CreateWorkspace(ctx context.Context, name, userID string) (
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	ws := &Workspace{}
 	wsQuery := `
@@ -120,7 +127,7 @@ func (r *Repository) RemoveMemberOrLeave(ctx context.Context, workspaceID, targe
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Check if targetUser is sole owner
 	var role string

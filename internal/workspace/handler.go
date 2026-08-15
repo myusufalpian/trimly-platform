@@ -26,7 +26,11 @@ func NewHandler(service workspaceService) *Handler {
 
 func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	user := r.Context().Value(auth.UserContextKey).(*auth.User)
+	user, ok := r.Context().Value(auth.UserContextKey).(*auth.User)
+	if !ok || user == nil {
+		httputil.RespondError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
 
 	var req CreateWorkspaceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -36,7 +40,11 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 
 	ws, err := h.service.CreateWorkspace(r.Context(), user.ID, req.Name)
 	if err != nil {
-		httputil.RespondError(w, http.StatusBadRequest, "CREATE_FAILED", err.Error())
+		if errors.Is(err, ErrInvalidInput) {
+			httputil.RespondError(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+			return
+		}
+		httputil.RespondError(w, http.StatusInternalServerError, "CREATE_FAILED", "unable to create workspace")
 		return
 	}
 
@@ -44,11 +52,15 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
-	user := r.Context().Value(auth.UserContextKey).(*auth.User)
+	user, ok := r.Context().Value(auth.UserContextKey).(*auth.User)
+	if !ok || user == nil {
+		httputil.RespondError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
 
 	workspaces, err := h.service.GetUserWorkspaces(r.Context(), user.ID)
 	if err != nil {
-		httputil.RespondError(w, http.StatusInternalServerError, "FETCH_FAILED", err.Error())
+		httputil.RespondError(w, http.StatusInternalServerError, "FETCH_FAILED", "unable to fetch workspaces")
 		return
 	}
 
@@ -82,7 +94,11 @@ func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 			httputil.RespondError(w, http.StatusForbidden, "FORBIDDEN", "insufficient workspace permissions")
 			return
 		}
-		httputil.RespondError(w, http.StatusBadRequest, "ADD_MEMBER_FAILED", err.Error())
+		if errors.Is(err, ErrInvalidInput) {
+			httputil.RespondError(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+			return
+		}
+		httputil.RespondError(w, http.StatusInternalServerError, "ADD_MEMBER_FAILED", "unable to add member")
 		return
 	}
 

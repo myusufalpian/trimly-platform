@@ -20,8 +20,8 @@ func TestCreateWorkspaceValidation(t *testing.T) {
 		t.Fatalf("expected error for empty workspace name, got nil")
 	}
 
-	if err.Error() != "workspace name is required" {
-		t.Errorf("expected error 'workspace name is required', got %q", err.Error())
+	if !errors.Is(err, workspace.ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput, got %v", err)
 	}
 }
 
@@ -33,8 +33,8 @@ func TestAddMemberValidation(t *testing.T) {
 		t.Fatalf("expected error for empty email, got nil")
 	}
 
-	if err.Error() != "email is required" {
-		t.Errorf("expected error 'email is required', got %q", err.Error())
+	if !errors.Is(err, workspace.ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput, got %v", err)
 	}
 }
 
@@ -178,8 +178,8 @@ func TestAddMemberRequiresEmail(t *testing.T) {
 	svc := workspace.NewService(repo)
 
 	err := svc.AddMember(context.Background(), "ws-1", "caller-1", "", workspace.RoleMember)
-	if err == nil || err.Error() != "email is required" {
-		t.Fatalf("expected email required error, got %v", err)
+	if err == nil || !errors.Is(err, workspace.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
 	}
 	if repo.addCalled {
 		t.Errorf("AddMemberByEmail must not be called when email is empty")
@@ -246,14 +246,18 @@ type stubWorkspaceService struct {
 	addedEmail    string
 	addedRole     workspace.Role
 	addedWsID     string
+	createWs      *workspace.Workspace
+	createWsErr   error
+	workspaces    []workspace.Workspace
+	listWsErr     error
 }
 
 func (s *stubWorkspaceService) CreateWorkspace(ctx context.Context, userID, name string) (*workspace.Workspace, error) {
-	return nil, nil
+	return s.createWs, s.createWsErr
 }
 
 func (s *stubWorkspaceService) GetUserWorkspaces(ctx context.Context, userID string) ([]workspace.Workspace, error) {
-	return nil, nil
+	return s.workspaces, s.listWsErr
 }
 
 func (s *stubWorkspaceService) AddMember(ctx context.Context, workspaceID, callerID, email string, role workspace.Role) error {
@@ -325,13 +329,93 @@ func TestAddMemberHandlerSuccess(t *testing.T) {
 }
 
 func TestAddMemberHandlerBusinessError(t *testing.T) {
-	handler := workspace.NewHandler(&stubWorkspaceService{addMemberErr: errors.New("unable to add member to workspace")})
+	handler := workspace.NewHandler(&stubWorkspaceService{addMemberErr: errors.New("database connection lost")})
 	rr := httptest.NewRecorder()
 	req := withUser(httptest.NewRequest("POST", "/v1/workspaces/members?workspace_id=ws-1", strings.NewReader(`{"user_email":"guest@test.com"}`)), "caller-1")
 
 	handler.AddMember(rr, req)
 
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 Internal Server Error for unexpected error, got %d", rr.Code)
+	}
+}
+
+func TestCreateWorkspaceHandlerSuccess(t *testing.T) {
+	handler := workspace.NewHandler(&stubWorkspaceService{createWs: &workspace.Workspace{ID: "ws-1", Name: "Test"}})
+	rr := httptest.NewRecorder()
+	req := withUser(httptest.NewRequest("POST", "/v1/workspaces", strings.NewReader(`{"name":"Test"}`)), "user-1")
+
+	handler.CreateWorkspace(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201, got %d", rr.Code)
+	}
+}
+
+func TestCreateWorkspaceHandlerValidationError(t *testing.T) {
+	handler := workspace.NewHandler(&stubWorkspaceService{createWsErr: workspace.ErrInvalidInput})
+	rr := httptest.NewRecorder()
+	req := withUser(httptest.NewRequest("POST", "/v1/workspaces", strings.NewReader(`{"name":""}`)), "user-1")
+
+	handler.CreateWorkspace(rr, req)
+
 	if rr.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 Bad Request for business error, got %d", rr.Code)
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestCreateWorkspaceHandlerGenericError(t *testing.T) {
+	handler := workspace.NewHandler(&stubWorkspaceService{createWsErr: errors.New("db error")})
+	rr := httptest.NewRecorder()
+	req := withUser(httptest.NewRequest("POST", "/v1/workspaces", strings.NewReader(`{"name":"Test"}`)), "user-1")
+
+	handler.CreateWorkspace(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", rr.Code)
+	}
+}
+
+func TestCreateWorkspaceHandlerUnauthenticated(t *testing.T) {
+	handler := workspace.NewHandler(&stubWorkspaceService{})
+	rr := httptest.NewRecorder()
+	handler.CreateWorkspace(rr, httptest.NewRequest("POST", "/v1/workspaces", strings.NewReader(`{"name":"Test"}`)))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestListWorkspacesHandlerSuccess(t *testing.T) {
+	handler := workspace.NewHandler(&stubWorkspaceService{workspaces: []workspace.Workspace{{ID: "ws-1"}}})
+	rr := httptest.NewRecorder()
+	req := withUser(httptest.NewRequest("GET", "/v1/workspaces", nil), "user-1")
+
+	handler.ListWorkspaces(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+}
+
+func TestListWorkspacesHandlerError(t *testing.T) {
+	handler := workspace.NewHandler(&stubWorkspaceService{listWsErr: errors.New("db error")})
+	rr := httptest.NewRecorder()
+	req := withUser(httptest.NewRequest("GET", "/v1/workspaces", nil), "user-1")
+
+	handler.ListWorkspaces(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", rr.Code)
+	}
+}
+
+func TestListWorkspacesHandlerUnauthenticated(t *testing.T) {
+	handler := workspace.NewHandler(&stubWorkspaceService{})
+	rr := httptest.NewRecorder()
+	handler.ListWorkspaces(rr, httptest.NewRequest("GET", "/v1/workspaces", nil))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
 	}
 }

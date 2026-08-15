@@ -1,6 +1,7 @@
 package httputil_test
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -343,5 +344,37 @@ func TestIPRateLimiterEvictsIdleEntries(t *testing.T) {
 
 	if !limiter.Allow("1.2.3.4") {
 		t.Error("expected fresh burst after idle eviction")
+	}
+}
+
+func TestRequestScheme(t *testing.T) {
+	t.Run("defaults to http", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/path", nil)
+		if got := httputil.RequestScheme(req); got != "http" {
+			t.Errorf("expected http, got %q", got)
+		}
+	})
+
+	t.Run("respects X-Forwarded-Proto", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/path", nil)
+		req.Header.Set("X-Forwarded-Proto", "https")
+		if got := httputil.RequestScheme(req); got != "https" {
+			t.Errorf("expected https, got %q", got)
+		}
+	})
+
+	t.Run("respects TLS", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "https://example.com/path", nil)
+		req.TLS = &tls.ConnectionState{}
+		if got := httputil.RequestScheme(req); got != "https" {
+			t.Errorf("expected https, got %q", got)
+		}
+	})
+}
+
+func TestBaseURL(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://example.com/path", nil)
+	if got := httputil.BaseURL(req); got != "http://example.com" {
+		t.Errorf("expected http://example.com, got %q", got)
 	}
 }

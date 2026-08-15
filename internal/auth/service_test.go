@@ -3,7 +3,9 @@ package auth_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +22,7 @@ type stubAuthRepo struct {
 	userByEmailErr   error
 	createSessionErr error
 	revokedToken     string
+	revokeErr        error
 	verificationErr  error
 }
 
@@ -50,11 +53,14 @@ func (s *stubAuthRepo) CreateSession(ctx context.Context, userID, rawToken strin
 
 func (s *stubAuthRepo) RevokeSession(ctx context.Context, rawToken string) error {
 	s.revokedToken = rawToken
-	return nil
+	return s.revokeErr
 }
 
 func (s *stubAuthRepo) GetSessionUser(ctx context.Context, rawToken string) (*auth.User, error) {
-	return nil, nil
+	if rawToken == "valid-token" {
+		return &auth.User{ID: "user-1", Email: "user@test.com", PlanCode: "FREE"}, nil
+	}
+	return nil, errors.New("invalid session")
 }
 
 type stubMailSender struct {
@@ -94,7 +100,7 @@ func TestRegisterEmailTaken(t *testing.T) {
 	svc, _ := newTestService(repo)
 
 	_, err := svc.Register(context.Background(), auth.RegisterRequest{Email: "taken@test.com", Password: "Password123"})
-	if err != auth.ErrEmailTaken {
+	if !errors.Is(err, auth.ErrEmailTaken) {
 		t.Fatalf("expected ErrEmailTaken, got %v", err)
 	}
 }
@@ -238,7 +244,7 @@ func TestLoginSessionCreationError(t *testing.T) {
 	svc, _ := newTestService(repo)
 
 	_, _, err := svc.Login(context.Background(), auth.LoginRequest{Email: "user@test.com", Password: "Password123"})
-	if err != context.Canceled {
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected session creation error to propagate, got %v", err)
 	}
 }
@@ -253,12 +259,22 @@ func TestVerifyEmailEmptyToken(t *testing.T) {
 	}
 }
 
+func TestVerifyEmailSuccess(t *testing.T) {
+	repo := &stubAuthRepo{}
+	svc, _ := newTestService(repo)
+
+	err := svc.VerifyEmail(context.Background(), auth.VerifyEmailRequest{Token: "valid-token"})
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+}
+
 func TestVerifyEmailPropagatesRepoError(t *testing.T) {
 	repo := &stubAuthRepo{verificationErr: context.Canceled}
 	svc, _ := newTestService(repo)
 
 	err := svc.VerifyEmail(context.Background(), auth.VerifyEmailRequest{Token: "tok"})
-	if err != context.Canceled {
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected repo error to propagate, got %v", err)
 	}
 }
@@ -272,5 +288,89 @@ func TestLogoutRevokesSession(t *testing.T) {
 	}
 	if repo.revokedToken != "session-tok" {
 		t.Errorf("expected session token to be revoked, got %q", repo.revokedToken)
+	}
+}
+
+func TestLogoutEmptyToken(t *testing.T) {
+	repo := &stubAuthRepo{}
+	svc, _ := newTestService(repo)
+
+	err := svc.Logout(context.Background(), "")
+	if err != nil {
+		t.Errorf("expected no error for empty token, got %v", err)
+	}
+}
+
+func TestLogoutDatabaseError(t *testing.T) {
+	repo := &stubAuthRepo{revokeErr: errors.New("database error")}
+	svc, _ := newTestService(repo)
+
+	err := svc.Logout(context.Background(), "session-tok")
+	if err == nil {
+		t.Error("expected error, got nil")
+	}
+}
+
+func TestGetUserFromSession(t *testing.T) {
+	svc, _ := newTestService(&stubAuthRepo{})
+
+	t.Run("valid session", func(t *testing.T) {
+		user, err := svc.GetUserFromSession(context.Background(), "valid-token")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if user.ID != "user-1" {
+			t.Errorf("expected user-1, got %q", user.ID)
+		}
+	})
+
+	t.Run("empty token", func(t *testing.T) {
+		_, err := svc.GetUserFromSession(context.Background(), "")
+		if err == nil {
+			t.Fatal("expected error for empty token")
+		}
+	})
+
+	t.Run("invalid session", func(t *testing.T) {
+		_, err := svc.GetUserFromSession(context.Background(), "bad-token")
+		if err == nil {
+			t.Fatal("expected error for invalid session")
+		}
+	})
+}
+
+type trackingMailSender struct {
+	sync.Mutex
+	sentEmails []string
+}
+
+func (m *trackingMailSender) SendVerificationEmail(toEmail, token string) error {
+	m.Lock()
+	defer m.Unlock()
+	m.sentEmails = append(m.sentEmails, toEmail)
+	return nil
+}
+
+func (m *trackingMailSender) count() int {
+	m.Lock()
+	defer m.Unlock()
+	return len(m.sentEmails)
+}
+
+func TestShutdownDrainsEmailQueue(t *testing.T) {
+	mailer := &trackingMailSender{}
+	svc := auth.NewService(&stubAuthRepo{}, mailer)
+
+	for i := 0; i < 5; i++ {
+		_, _ = svc.Register(context.Background(), auth.RegisterRequest{
+			Email:    fmt.Sprintf("user%d@test.com", i),
+			Password: "Password123",
+		})
+	}
+
+	svc.Shutdown()
+
+	if mailer.count() != 5 {
+		t.Errorf("expected 5 emails sent after shutdown, got %d", mailer.count())
 	}
 }
